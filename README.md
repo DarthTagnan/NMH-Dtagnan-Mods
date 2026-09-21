@@ -14,7 +14,7 @@
 
 **Custom DXVK build · SMAA · Color LUT · Bloom · Vignette · CAS · Dithering**
 
-**Installer version 1.1.1**
+**Installer version 1.1.3**
 
 </div>
 
@@ -34,9 +34,19 @@ Linux is required. This is not a Windows mod or Windows installer.
 
 ## Before and after
 
-| Original presentation | Dtagnan Mods post-processing |
-|:---:|:---:|
-| ![Original presentation](Comparison/Before.png) | ![Dtagnan Mods post-processing](Comparison/After.png) |
+<p align="center">
+  <strong>Original presentation</strong>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <strong>Dtagnan Mods post-processing</strong>
+</p>
+
+<p align="center">
+  <a href="./Comparison/Before.png">
+    <img src="./Comparison/Before.png" alt="Original presentation" width="49%">
+  </a>
+  <a href="./Comparison/After.png">
+    <img src="./Comparison/After.png" alt="Dtagnan Mods post-processing" width="49%">
+  </a>
+</p>
 
 The installer can also display these images from its interactive menu. With
 `chafa`, Kitty or WezTerm, they are rendered directly inside the terminal.
@@ -237,6 +247,21 @@ The release manifest can also be checked independently:
 ```bash
 sha256sum -c SHA256SUMS
 ```
+
+## Transaction safety and crash recovery
+
+The installer stages every DLL, configuration and backup as a temporary file
+in the destination directory, then commits it with an atomic rename. This
+prevents a failed copy from truncating a working file.
+
+Additional safeguards include:
+
+- restoration metadata is committed before the game DLLs are changed;
+- `SIGINT`, `SIGHUP` and `SIGTERM` trigger temporary-file cleanup;
+- an interrupted second DLL installation remains fully restorable;
+- an interrupted configuration update preserves the previous configuration;
+- the next installation removes stale transaction files left by an
+  untrappable interruption such as power loss or `SIGKILL`.
 
 ## Updating
 
