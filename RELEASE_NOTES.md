@@ -1,9 +1,26 @@
-# Dtagnan Mods 1.1
+# Dtagnan Mods 1.1.1
 
-This release replaces the original single-platform installer with a safer,
-portable Linux and Steam installer for No More Heroes.
+Release tag: `v1.1.1`
+
+This final maintenance release hardens the portable Linux and Steam installer
+for No More Heroes and completes automatic Steam configuration.
 
 ## Highlights
+
+- Automatic Launch Options injection with no custom Steam command or
+  copy/paste required.
+- Command inspector that preserves `gamemoderun`, `mangohud`, Gamescope and
+  unrelated user arguments while deduplicating variables managed by the mod.
+- Safe removal of only Dtagnan Mods variables when Launch Options were edited
+  after installation.
+- Steam account selection prefers `loginusers.vdf`'s `MostRecent` account and
+  falls back to the newest valid profile.
+- Per-user operation locking prevents concurrent install, update and restore
+  processes from racing; stale locks recover automatically.
+- Steam process detection is restricted to the current Linux user.
+- Transaction ordering is hardened for interruptions while Steam is running.
+- Custom external Steam Flatpak libraries can be selected with
+  `DTAGNAN_STEAM_FLATPAK=1` and an explicit game path.
 
 - Native Steam and Steam Flatpak support.
 - Steam Deck and SteamOS detection without modifying the immutable system
@@ -11,7 +28,11 @@ portable Linux and Steam installer for No More Heroes.
 - Internal storage, additional Steam libraries and Steam Deck microSD support.
 - Fedora (`dnf`), Debian/Ubuntu (`apt`), Arch (`pacman`) and openSUSE
   (`zypper`) dependency routing.
-- NVIDIA hybrid, NVIDIA-only, AMD and Intel launch-option profiles.
+- NVIDIA hybrid, NVIDIA-only, AMD and Intel per-game launch-option profiles.
+- Automatic Steam configuration: no Launch Options copy/paste is required, and the previous value is restored on uninstall. If Steam is running, the installer pauses and waits for the user to close it and confirm with `y` instead of aborting.
+- Transactional Steam shutdown handling: installation and removal now wait for
+  Steam before changing files, while signal rollback remains non-interactive
+  and preserves recovery metadata instead of blocking.
 - Live system status in the interactive menu.
 - Atomic file replacement and automatic rollback after interruption or failed
   installation.
@@ -23,7 +44,8 @@ portable Linux and Steam installer for No More Heroes.
 
 ## Validation
 
-- 107 crash, rollback, path, backup, dependency and lifecycle tests passed.
+- Expanded crash, rollback, path, backup, dependency and lifecycle validation
+  passed, including interrupted Steam-wait scenarios.
 - Full Podman matrices passed on Fedora, Ubuntu, Arch Linux and openSUSE
   Tumbleweed.
 - Actual container package tests confirmed:

@@ -1,6 +1,11 @@
-<p align="center">
-  <img src="./assets/dtagnan-mods-banner.png" alt="Dtagnan Mods" width="100%">
-</p>
+```text
+ DDDD  TTTTT  AAA   GGG  N   N  AAA  N   N    M   M  OOO  DDDD  SSSS
+ D   D   T   A   A G     NN  N A   A NN  N    MM MM O   O D   D S
+ D   D   T   AAAAA G  GG N N N AAAAA N N N    M M M O   O D   D SSS
+ D   D   T   A   A G   G N  NN A   A N  NN    M   M O   O D   D    S
+ DDDD    T   A   A  GGG  N   N A   A N   N    M   M  OOO  DDDD  SSSS
+```
+
 <div align="center">
 
 # Dtagnan Mods — No More Heroes
@@ -9,7 +14,7 @@
 
 **Custom DXVK build · SMAA · Color LUT · Bloom · Vignette · CAS · Dithering**
 
-**Version 1.1**
+**Version 1.1.1 · Release tag `v1.1.1`**
 
 </div>
 
@@ -29,13 +34,19 @@ Linux is required. This is not a Windows mod or Windows installer.
 
 ## Before and after
 
+<p align="center">
+  <strong>Original presentation</strong>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <strong>Dtagnan Mods post-processing</strong>
+</p>
 
-
-| Original presentation | Dtagnan Mods post-processing |
-|:---:|:---:|
-| ![Original presentation](Comparison/Before.png) | ![Dtagnan Mods post-processing](Comparison/After.png) |
-
-
+<p align="center">
+  <a href="./Comparison/Before.png">
+    <img src="./Comparison/Before.png" alt="Original presentation" width="49%">
+  </a>
+  <a href="./Comparison/After.png">
+    <img src="./Comparison/After.png" alt="Dtagnan Mods post-processing" width="49%">
+  </a>
+</p>
 
 ## What the mod installs
 
@@ -89,8 +100,53 @@ Snap Steam is detected but intentionally refused because its confined
 filesystem cannot currently be supported safely.
 
 NVIDIA PRIME variables are added only when a hybrid NVIDIA system is detected.
-AMD, Intel and NVIDIA-only systems receive vendor-appropriate launch options
-without unnecessary PRIME variables.
+AMD, Intel and NVIDIA-only systems receive vendor-appropriate per-game settings
+without unnecessary PRIME variables. The installer writes the required Steam
+configuration automatically; no Launch Options copy/paste is required.
+
+## Automatic Steam Launch Options injection
+
+Dtagnan Mods configures No More Heroes directly in Steam's per-user
+`localconfig.vdf`. You do **not** need to paste a custom command into the
+game's Launch Options field.
+
+The installer safely inspects any options already configured for AppID
+`1420290`:
+
+- variables supplied by Dtagnan Mods are kept only once;
+- obsolete or conflicting values managed by the mod are replaced;
+- unrelated commands such as `gamemoderun`, `mangohud`, Gamescope options and
+  game arguments are preserved and combined with the mod configuration;
+- `%command%` is normalized to one correctly positioned entry;
+- the original value is backed up for uninstallation;
+- if the user changes Launch Options afterward, uninstallation removes only
+  the variables managed by Dtagnan Mods and keeps the user's additions.
+
+Steam must be fully closed while this file is written. If Steam is running,
+the installer pauses before changing any game file and asks the user to close
+it. No custom launch command or manual copy/paste step is required.
+
+## Built-in functions
+
+Everything needed for normal use is automated by `install.sh`:
+
+| Function | What it does | Changes files? |
+|---|---|---|
+| **Installer / Updater** | Finds No More Heroes, checks all prerequisites, backs up the original state, installs DXVK and vkBasalt files, then configures Steam. Running it again safely updates the mod. | Yes |
+| **Launch Options Inspector** | Reads the active Steam account's existing command, keeps unrelated user commands, replaces conflicting mod variables, removes exact duplicates and ensures a single `%command%`. | Only during install/update/restore |
+| **System Doctor** | Reports the platform, Steam backend, game path, GPU, 32-bit Vulkan, 32-bit vkBasalt, write access and package integrity without installing the mod. | No |
+| **Verifier** | Compares installed DLLs, shaders, LUT, configuration, dependencies and recovery metadata with the release. | No |
+| **Automatic Recovery** | Rolls back a failed or interrupted installation and removes stale temporary files on the next run. | Only to restore a safe state |
+| **Restore / Uninstaller** | Restores original game DLLs and the user's Steam settings. Commands added by the user after installation are retained. | Yes |
+| **Operation Lock** | Prevents two installers from changing the same installation simultaneously and safely recovers a stale lock. | Temporary lock only |
+| **Dependency Test** | Simulates missing dependencies and tests the distribution-specific installation path without installing packages. | No (dry run) |
+| **Comparison Viewer** | Shows the supplied before/after images in a supported terminal or image viewer. | No |
+| **About** | Displays an offline explanation of the mod and all its automated safety features. | No |
+
+The **Inspector** does not cancel an entire custom command. It removes only
+duplicate or conflicting parts managed by Dtagnan Mods. For example, a user's
+`gamemoderun`, `mangohud`, Gamescope flags and game arguments remain in place,
+while an existing identical `ENABLE_VKBASALT=1` is kept only once.
 
 ## Requirements
 
@@ -101,7 +157,7 @@ without unnecessary PRIME variables.
 - A Vulkan-capable GPU and working Vulkan driver
 - 64-bit and 32-bit Vulkan userspace support
 - vkBasalt with its 32-bit Vulkan layer
-- Bash and standard GNU/Linux command-line tools
+- Bash, Python 3 and standard GNU/Linux command-line tools
 - Optional: `chafa` for terminal image previews
 
 The executable `nmh.exe` is 32-bit. A system with only 64-bit Vulkan or
@@ -181,6 +237,22 @@ detected in locations such as:
 ~/.local/lib/libvkbasalt.so
 ```
 
+For the most reliable Steam Deck installation:
+
+1. Switch to **Desktop Mode**.
+2. Start Steam once and confirm that No More Heroes appears in the Library.
+3. If the game is on microSD, keep that library registered in Steam under
+   **Settings → Storage**.
+4. Exit Steam completely, including its tray process.
+5. Run `./install.sh doctor`, followed by `./install.sh install`.
+6. Reopen Steam and launch the game normally. Leave Launch Options alone; the
+   required configuration has already been injected.
+
+The installer never calls `steamos-readonly`, never unlocks the immutable
+SteamOS image and never installs a system package automatically on SteamOS.
+Internal storage and registered microSD libraries use the same installation
+and recovery logic.
+
 ### Steam Flatpak
 
 Steam Flatpak requires a vkBasalt Vulkan-layer extension inside its Flatpak
@@ -196,6 +268,8 @@ DTAGNAN_STEAM_FLATPAK=1 \
 ```
 
 ## Installation
+
+### Simple automatic installation
 
 1. Download and extract the complete release.
 
@@ -219,14 +293,20 @@ DTAGNAN_STEAM_FLATPAK=1 \
    ./install.sh
    ```
 
-5. Select **Install or update the mod**.
+5. Select **Install or update the mod**. If Steam is running, the installer pauses and asks you to close it. Once Steam is fully closed, type `y` and press Enter to continue.
 
-6. Select **Show Steam launch options** and copy the complete generated line
-   into:
+   No game file or Steam setting is changed while this prompt is waiting. If
+   the installer is interrupted, it can be started again safely.
 
-   **Steam → Library → No More Heroes → Properties → General → Launch Options**
+6. The installer configures the required No More Heroes Steam Launch Options
+   automatically. Existing custom commands are inspected, deduplicated and
+   preserved. No copy/paste is required.
 
-7. Start the game normally from Steam.
+7. Start Steam and launch the game normally.
+
+That is the complete installation. Do not add anything to Steam's **Launch
+Options** field: the Inspector performs that step automatically and combines
+the mod with any command already there.
 
 Do not run the installer with `sudo`. It intentionally refuses root execution
 to prevent files from being installed in root's home directory.
@@ -243,6 +323,20 @@ to prevent files from being installed in root's home directory.
 ./install.sh doctor
 ./install.sh test-deps
 ```
+
+Command details:
+
+- `install`: automatic install or update, including inspection of Steam Launch
+  Options and rollback on failure;
+- `verify`: read-only verification of the installed mod;
+- `restore`: safe uninstall and restoration of the original state;
+- `options`: preview the exact automatic Steam configuration and Inspector
+  behavior;
+- `about`: explain the components and automated functions offline;
+- `compare`: display the supplied before/after images;
+- `doctor`: run the complete read-only system diagnostic;
+- `test-deps`: dry-run the dependency installation logic without changing the
+  system.
 
 For an unusual Steam layout, provide the game directory explicitly:
 
@@ -289,6 +383,7 @@ prevents a failed copy from truncating a working file.
 Additional safeguards include:
 
 - restoration metadata is committed before the game DLLs are changed;
+- a per-user operation lock prevents concurrent installers from racing;
 - `SIGINT`, `SIGHUP` and `SIGTERM` trigger rollback and temporary-file cleanup;
 - an interrupted second DLL installation remains fully restorable;
 - an interrupted configuration update preserves the previous configuration;
@@ -297,19 +392,13 @@ Additional safeguards include:
 - a failed installation restores the original DLLs and configuration
   automatically before exiting.
 
-## Automated tests
+## Automated validation
 
-The release includes two test programs:
-
-```bash
-./audit_crash_test.sh
-./podman-platform-tests.sh --full-packages
-```
-
-The crash suite covers 107 scenarios, including installation, verification,
-uninstallation, interrupted writes, rollback, repeated updates, corrupt
-metadata, Steam libraries, Flatpak, Steam Deck microSD paths, Unicode paths,
-custom XDG directories and GPU launch options.
+The installer was validated with an expanded development crash suite covering
+installation, verification, uninstallation, interrupted
+writes, rollback, repeated updates, corrupt metadata, Steam libraries, Flatpak,
+Steam Deck microSD paths, Unicode paths, custom XDG directories and GPU launch
+options. The development test programs are not included in the release archive.
 
 The full Podman matrix passed on all four tested distribution families:
 
@@ -352,7 +441,10 @@ DLLs and an NMH vkBasalt configuration already existed:
 
 Restoration data is created separately for every Linux user. No original game
 DLL from the developer's computer is included or reused. After restoration,
-remove the mod launch options from Steam.
+the installer restores the previous No More Heroes Steam Launch Options
+automatically. If the value was edited after installation, the uninstaller
+removes only the variables managed by Dtagnan Mods and preserves the user's
+newer commands.
 
 ## Installed locations
 
@@ -389,9 +481,49 @@ inside the Flatpak sandbox.
 
 The selected directory must contain `nmh.exe`.
 
+### Steam Deck troubleshooting
+
+- Run the installer from Desktop Mode as the normal `deck` user, never with
+  `sudo`.
+- Close Steam completely before confirming the installer prompt. A minimized
+  Steam window or `steamwebhelper` process still counts as running.
+- Run `./install.sh doctor` to inspect Steam, game, GPU, Vulkan and vkBasalt
+  detection without changing the installation.
+- For a microSD installation, verify that the card is mounted and registered
+  in Steam's Storage settings. The installer reads `libraryfolders.vdf`; it
+  does not scan arbitrary disks.
+- If `localconfig.vdf` is missing, start Steam once, open the No More Heroes
+  Properties window, close Steam completely and run the installer again.
+- If several accounts exist, the account marked `MostRecent` in Steam's
+  `loginusers.vdf` is preferred. The newest valid profile is the fallback.
+- A 64-bit vkBasalt installation alone is insufficient because `nmh.exe` is
+  32-bit. A 32-bit `libvkbasalt.so` must be visible to native Steam.
+- Do not disable SteamOS read-only mode. Missing system components cause a safe
+  stop before game files are changed.
+- For Steam Flatpak on Deck, install a matching i386 vkBasalt runtime extension
+  inside Flatpak. Native Steam remains the recommended Deck configuration.
+
+Useful read-only checks:
+
+```bash
+./install.sh doctor
+file ~/.local/lib32/libvkbasalt.so
+grep -n '1420290' ~/.local/share/Steam/userdata/*/config/localconfig.vdf
+```
+
+These are diagnostic commands only. They are not Steam Launch Options.
+
+### Existing custom Steam commands
+
+No manual cleanup is normally required. During installation, the command
+inspector combines unrelated options with the mod configuration and removes
+duplicates of variables it manages. During restoration, it returns the
+original value or strips only Dtagnan Mods variables from a newer user-edited
+value.
+
 ### vkBasalt does not appear in the game
 
-- Confirm that the entire generated launch line was copied into Steam.
+- Run `./install.sh install` again so the per-game Steam configuration can be refreshed. If Steam is running, the installer pauses and asks you to close it; type `y` once Steam is fully closed.
 - Confirm that the 32-bit vkBasalt layer is installed.
 - For Steam Flatpak, confirm that the layer exists inside the Flatpak runtime.
 - Press **F10** and compare the image with the effects enabled and disabled.

@@ -1,6 +1,6 @@
 # NMH Dtagnan Mods - Custom DXVK Source
 
-The DXVK binaries included with NMH Dtagnan Mods 1.1 are based on
+The DXVK binaries included with NMH Dtagnan Mods 1.1.1 are based on
 the upstream DXVK project with a custom built-in profile for
 No More Heroes.
 
@@ -45,7 +45,7 @@ Clone upstream DXVK:
     git clone https://github.com/doitsujin/dxvk.git
     cd dxvk
 
-Checkout the exact upstream revision used by NMH Dtagnan Mods 1.1:
+Checkout the exact upstream revision used by NMH Dtagnan Mods 1.1.1:
 
     git checkout 60193094
 

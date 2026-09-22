@@ -2,11 +2,10 @@
 set -Eeuo pipefail
 
 APP_ID="1420290"
-GAME_NAME="No More Heroes"
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 ACTION="${1:-menu}"
 EXPLICIT_GAME_DIR="${2:-}"
-MOD_VERSION="1.1"
+MOD_VERSION="1.1.1"
 D3D11_SHA256="4edc6a6abb56a056b37799edb510e9b52209fe3f47e25722c676346cddc16428"
 DXGI_SHA256="bc82659d936412f8c1d911adbba859b09733ad0174190c683665058e4990106e"
 BEFORE_SHA256="25d1306a9a599bc70667654ac0f9d0230cd4f733415728ab3ed6ffffe7f1fbcc"
@@ -23,6 +22,9 @@ CONFIG_DIR="$CONFIG_HOME/vkBasalt"
 CONFIG_FILE="$CONFIG_DIR/nmh.conf"
 CONFIG_BACKUP="$CONFIG_DIR/nmh.conf.pre-dtagnan-mods"
 BACKUP_STATE="$BACKUP_DIR/install-state"
+STEAM_STATE="$BACKUP_DIR/steam-launch-state"
+STEAM_OPTIONS_BACKUP="$BACKUP_DIR/steam-launch-options.previous"
+STEAM_OPTIONS_INSTALLED="$BACKUP_DIR/steam-launch-options.installed"
 VISIBLE_RUNTIME_DIR="$RUNTIME_DIR"
 VISIBLE_CONFIG_FILE="$CONFIG_FILE"
 COMPARISON_DIR="$ROOT/Comparison"
@@ -31,12 +33,52 @@ AFTER_IMAGE="$COMPARISON_DIR/After.png"
 TEMP_FILES=()
 INSTALL_TRANSACTION_ACTIVE=0
 INSTALL_TRANSACTION_GAME=""
+OPERATION_LOCK_DIR=""
+OPERATION_LOCK_ACTIVE=0
 
 cleanup_temp_files() {
   local temporary
   for temporary in "${TEMP_FILES[@]}"; do
     [[ -n "$temporary" ]] && rm -f -- "$temporary"
   done
+}
+
+release_operation_lock() {
+  [[ "$OPERATION_LOCK_ACTIVE" == "1" ]] || return 0
+  rm -f -- "$OPERATION_LOCK_DIR/pid"
+  rmdir -- "$OPERATION_LOCK_DIR" 2>/dev/null || true
+  OPERATION_LOCK_ACTIVE=0
+}
+
+acquire_operation_lock() {
+  local saved_pid="" lock_is_stale=0
+  OPERATION_LOCK_DIR="$RUNTIME_DIR/.operation-lock"
+  mkdir -p -- "$RUNTIME_DIR"
+
+  if ! mkdir -- "$OPERATION_LOCK_DIR" 2>/dev/null; then
+    if [[ -r "$OPERATION_LOCK_DIR/pid" ]]; then
+      saved_pid="$(head -n1 -- "$OPERATION_LOCK_DIR/pid" 2>/dev/null || true)"
+    fi
+
+    # A crash can occur after mkdir and before the PID is committed. Treat a
+    # missing, unreadable or malformed PID file as stale instead of leaving a
+    # permanent lock that requires manual cleanup.
+    if [[ ! "$saved_pid" =~ ^[0-9]+$ ]] || ! kill -0 "$saved_pid" 2>/dev/null; then
+      lock_is_stale=1
+    fi
+
+    if (( lock_is_stale )); then
+      rm -f -- "$OPERATION_LOCK_DIR/pid"
+      rmdir -- "$OPERATION_LOCK_DIR" 2>/dev/null || true
+      mkdir -- "$OPERATION_LOCK_DIR" 2>/dev/null || \
+        die "Another Dtagnan Mods operation is already using: $RUNTIME_DIR"
+    else
+      die "Another Dtagnan Mods installation or restoration is already running."
+    fi
+  fi
+
+  printf '%s\n' "$$" > "$OPERATION_LOCK_DIR/pid"
+  OPERATION_LOCK_ACTIVE=1
 }
 
 rollback_failed_install() {
@@ -74,6 +116,12 @@ $SHADER_DIR/NMH_Vignette.fx|$ROOT/vkBasalt/Shaders/NMH_Vignette.fx
 $SHADER_DIR/NMH_Dither.fx|$ROOT/vkBasalt/Shaders/NMH_Dither.fx
 $LUT_DIR/nmh-color.cube|$ROOT/vkBasalt/LUTs/nmh-color.cube
 EOF
+  if [[ -f "${STEAM_STATE:-}" ]]; then
+    # EXIT/signal cleanup must never prompt or block while Steam is running.
+    # Keep the Steam recovery metadata intact so a later install/restore can
+    # finish the operation safely after Steam has been closed.
+    restore_steam_launch_options noninteractive || true
+  fi
   set -e
   printf '\n  %s%s[ROLLBACK]%s Installation failed; original game files were restored.\n' \
     "${BOLD:-}" "${YELLOW:-}" "${RESET:-}" >&2
@@ -85,6 +133,7 @@ cleanup_on_exit() {
     rollback_failed_install
   fi
   cleanup_temp_files
+  release_operation_lock
   return "$rc"
 }
 
@@ -149,7 +198,6 @@ detect_platform() {
   PLATFORM_NAME="Linux"
 
   OS_ID=""
-  OS_ID_LIKE=""
   OS_NAME=""
   OS_VARIANT_ID=""
 
@@ -172,7 +220,6 @@ detect_platform() {
 
   if [[ -r /etc/os-release ]]; then
     OS_ID="$(sed -n 's/^ID=//p' /etc/os-release | head -n1 | tr -d '"')"
-    OS_ID_LIKE="$(sed -n 's/^ID_LIKE=//p' /etc/os-release | head -n1 | tr -d '"')"
     OS_NAME="$(sed -n 's/^NAME=//p' /etc/os-release | head -n1 | tr -d '"')"
     OS_VARIANT_ID="$(sed -n 's/^VARIANT_ID=//p' /etc/os-release | head -n1 | tr -d '"')"
 
@@ -209,7 +256,7 @@ preflight() {
   fi
 
   local command
-  for command in realpath install cmp sed grep awk sha256sum file head cp mv rm rmdir mkdir chmod uname; do
+  for command in realpath install cmp sed grep awk sha256sum file head cp mv rm rmdir mkdir chmod uname python3; do
     require_command "$command"
   done
 }
@@ -231,6 +278,17 @@ install_atomic() {
     rm -f -- "$temporary"
     die "Failed to install: $destination"
   fi
+}
+
+write_text_atomic() {
+  local destination="$1" content="$2" mode="${3:-0600}"
+  local temporary="$destination.dtagnan-tmp.$$"
+  TEMP_FILES+=("$temporary")
+
+  mkdir -p -- "$(dirname -- "$destination")"
+  printf '%s' "$content" > "$temporary"
+  chmod "$mode" "$temporary"
+  mv -f -- "$temporary" "$destination"
 }
 
 cleanup_stale_install_files() {
@@ -268,30 +326,47 @@ steam_library_paths() {
     "$library_file"
 }
 
+steam_root_entries() {
+  printf '%s\n' \
+    "native|$HOME/.local/share/Steam" \
+    "native|$HOME/.local/share/steam" \
+    "native|$HOME/.steam/steam" \
+    "native|$HOME/.steam/root" \
+    "native|$HOME/.steam/debian-installation" \
+    "native|${XDG_DATA_HOME:-$HOME/.local/share}/Steam" \
+    "native|${XDG_DATA_HOME:-$HOME/.local/share}/steam" \
+    "flatpak|$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam" \
+    "flatpak|$HOME/.var/app/com.valvesoftware.Steam/.local/share/steam" \
+    "flatpak|$HOME/.var/app/com.valvesoftware.Steam/data/Steam" \
+    "flatpak|$HOME/.var/app/com.valvesoftware.Steam/data/steam" \
+    "snap|$HOME/snap/steam/common/.local/share/Steam"
+}
+
+steam_root_paths() {
+  local entry
+  while IFS= read -r entry; do
+    printf '%s\n' "${entry#*|}"
+  done < <(steam_root_entries)
+}
+
 steam_backend_for_game() {
   local game_dir="$1"
   local backend steam_root library_file path
-  local -a entries=(
-    "native|$HOME/.local/share/Steam"
-    "native|$HOME/.local/share/steam"
-    "native|$HOME/.steam/steam"
-    "native|$HOME/.steam/root"
-    "native|$HOME/.steam/debian-installation"
-    "native|${XDG_DATA_HOME:-$HOME/.local/share}/Steam"
-    "native|${XDG_DATA_HOME:-$HOME/.local/share}/steam"
+  local -a entries=()
 
-    "flatpak|$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"
-    "flatpak|$HOME/.var/app/com.valvesoftware.Steam/.local/share/steam"
-    "flatpak|$HOME/.var/app/com.valvesoftware.Steam/data/Steam"
-    "flatpak|$HOME/.var/app/com.valvesoftware.Steam/data/steam"
-
-    "snap|$HOME/snap/steam/common/.local/share/Steam"
-  )
+  mapfile -t entries < <(steam_root_entries)
 
   [[ -n "$game_dir" ]] || {
     printf 'unknown\n'
     return
   }
+
+  # Explicit override for a custom external library used by Steam Flatpak.
+  # The path alone may live outside Flatpak data and cannot identify its owner.
+  if [[ "${DTAGNAN_STEAM_FLATPAK:-0}" == "1" ]]; then
+    printf 'flatpak\n'
+    return
+  fi
 
   game_dir="$(realpath -m -- "$game_dir")"
 
@@ -347,25 +422,7 @@ find_game_dir() {
     return
   fi
 
-  steam_roots=(
-    # Native Steam
-    "$HOME/.local/share/Steam"
-    "$HOME/.local/share/steam"
-    "$HOME/.steam/steam"
-    "$HOME/.steam/root"
-    "$HOME/.steam/debian-installation"
-    "${XDG_DATA_HOME:-$HOME/.local/share}/Steam"
-    "${XDG_DATA_HOME:-$HOME/.local/share}/steam"
-
-    # Flatpak Steam
-    "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"
-    "$HOME/.var/app/com.valvesoftware.Steam/.local/share/steam"
-    "$HOME/.var/app/com.valvesoftware.Steam/data/Steam"
-    "$HOME/.var/app/com.valvesoftware.Steam/data/steam"
-
-    # Snap Steam
-    "$HOME/snap/steam/common/.local/share/Steam"
-  )
+  mapfile -t steam_roots < <(steam_root_paths)
 
   # Register a Steam library only once.
   add_steamapps_dir() {
@@ -536,6 +593,9 @@ configure_install_scope() {
   LUT_DIR="$RUNTIME_DIR/LUTs"
   BACKUP_DIR="$RUNTIME_DIR/Vanilla-backup"
   BACKUP_STATE="$BACKUP_DIR/install-state"
+  STEAM_STATE="$BACKUP_DIR/steam-launch-state"
+  STEAM_OPTIONS_BACKUP="$BACKUP_DIR/steam-launch-options.previous"
+  STEAM_OPTIONS_INSTALLED="$BACKUP_DIR/steam-launch-options.installed"
 }
 
 check_package() {
@@ -989,6 +1049,468 @@ detect_gpu_vendor() {
   fi
 }
 
+steam_process_running() {
+  local proc comm process_uid proc_root="${DTAGNAN_PROC_ROOT:-/proc}"
+  for proc in "$proc_root"/[0-9]*; do
+    [[ -r "$proc/comm" ]] || continue
+    process_uid="$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$proc/status" 2>/dev/null | head -n1)"
+    [[ "$process_uid" == "$EUID" ]] || continue
+    IFS= read -r comm < "$proc/comm" || continue
+    case "$comm" in
+      steam|steamwebhelper) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+wait_for_steam_exit() {
+  local answer
+
+  while steam_process_running; do
+    warning "Steam is currently running and must be closed before its No More Heroes configuration can be changed safely."
+    printf '  Close Steam completely, then type y and press Enter to continue: ' >&2
+    IFS= read -r answer || die "Input cancelled while waiting for Steam to close."
+
+    if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
+      warning "Waiting for Steam to be closed. Type y only when Steam has fully exited."
+      continue
+    fi
+
+    if steam_process_running; then
+      warning "Steam is still running. Close all Steam windows/processes, then confirm again."
+    fi
+  done
+}
+
+steam_root_for_game() {
+  local game_dir="$1" steam_root library_file path
+  local -a roots=()
+
+  mapfile -t roots < <(steam_root_paths)
+
+  game_dir="$(realpath -m -- "$game_dir")"
+
+  for steam_root in "${roots[@]}"; do
+    [[ -d "$steam_root/steamapps" ]] || continue
+    steam_root="$(realpath -m -- "$steam_root")"
+
+    if [[ "$game_dir" == "$steam_root/steamapps/common/"* ]]; then
+      printf '%s\n' "$steam_root"
+      return 0
+    fi
+
+    library_file="$steam_root/steamapps/libraryfolders.vdf"
+    [[ -f "$library_file" ]] || continue
+    while IFS= read -r path; do
+      path="${path//\\\\/\\}"
+      [[ -n "$path" ]] || continue
+      path="$(realpath -m -- "$path")"
+      if [[ "$game_dir" == "$path/steamapps/common/"* ]]; then
+        printf '%s\n' "$steam_root"
+        return 0
+      fi
+    done < <(steam_library_paths "$library_file")
+  done
+
+  return 1
+}
+
+find_active_localconfig() {
+  local game_dir="$1" steam_root candidate newest="" recent_user=""
+  steam_root="$(steam_root_for_game "$game_dir")" || return 1
+
+  # Prefer Steam's explicitly marked most-recent account. Falling back to the
+  # newest localconfig keeps compatibility with older or incomplete profiles.
+  if [[ -f "$steam_root/config/loginusers.vdf" ]]; then
+    recent_user="$(
+      awk '
+        /^[[:space:]]*"[0-9]+"[[:space:]]*$/ {
+          user=$0
+          gsub(/[[:space:]\"]/, "", user)
+        }
+        /^[[:space:]]*"MostRecent"[[:space:]]*"1"[[:space:]]*$/ {
+          if (user != "") { print user; exit }
+        }
+      ' "$steam_root/config/loginusers.vdf"
+    )"
+
+    candidate="$steam_root/userdata/$recent_user/config/localconfig.vdf"
+    if [[ "$recent_user" =~ ^[0-9]+$ && -f "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+
+  shopt -s nullglob
+  for candidate in "$steam_root"/userdata/*/config/localconfig.vdf; do
+    [[ -f "$candidate" ]] || continue
+    if [[ -z "$newest" || "$candidate" -nt "$newest" ]]; then
+      newest="$candidate"
+    fi
+  done
+  shopt -u nullglob
+
+  [[ -n "$newest" ]] || return 1
+  printf '%s\n' "$newest"
+}
+
+steam_vdf_launch_options() {
+  local mode="$1" file="$2" value="${3:-}"
+  python3 - "$mode" "$file" "$APP_ID" "$value" <<'PYVDF'
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+mode, filename, appid, value = sys.argv[1:5]
+p = Path(filename)
+s = p.read_text(errors="surrogateescape")
+
+# Find the app block by walking quoted VDF keys and braces. This intentionally
+# edits only Software/Valve/Steam/apps/<appid> and preserves the rest verbatim.
+tok = re.compile(r'"((?:\\.|[^"\\])*)"|([{}])')
+tokens = list(tok.finditer(s))
+stack = []
+pending = None
+app_open = app_close = None
+
+for i, m in enumerate(tokens):
+    if m.group(1) is not None:
+        pending = m.group(1)
+        continue
+    brace = m.group(2)
+    if brace == '{':
+        stack.append(pending)
+        pending = None
+        if stack[-4:] == ['Software', 'Valve', 'Steam', 'apps']:
+            pass
+        elif len(stack) >= 5 and stack[-5:-1] == ['Software', 'Valve', 'Steam', 'apps'] and stack[-1] == appid:
+            app_open = m.end()
+    else:
+        if app_open is not None and len(stack) >= 5 and stack[-5:-1] == ['Software', 'Valve', 'Steam', 'apps'] and stack[-1] == appid:
+            app_close = m.start()
+            break
+        if stack:
+            stack.pop()
+        pending = None
+
+if app_open is None or app_close is None:
+    raise SystemExit(f"No Steam app block found for AppID {appid} in {filename}")
+
+body = s[app_open:app_close]
+line_re = re.compile(r'(?m)^(?P<indent>[ \t]*)"LaunchOptions"[ \t]+"(?P<value>(?:\\.|[^"\\])*)"[ \t]*$')
+m = line_re.search(body)
+
+def unescape(v):
+    return v.replace('\\\\', '\\').replace('\\"', '"')
+
+def escape(v):
+    return v.replace('\\', '\\\\').replace('"', '\\"')
+
+if mode == 'get':
+    if m:
+        sys.stdout.write('present\n' + unescape(m.group('value')))
+    else:
+        sys.stdout.write('absent\n')
+    raise SystemExit(0)
+
+if mode not in ('set', 'remove'):
+    raise SystemExit('invalid VDF edit mode')
+
+if mode == 'remove':
+    if m:
+        start, end = m.span()
+        if end < len(body) and body[end:end+1] == '\n':
+            end += 1
+        body = body[:start] + body[end:]
+else:
+    escaped = escape(value)
+    if m:
+        replacement = f'{m.group("indent")}"LaunchOptions"\t\t"{escaped}"'
+        body = body[:m.start()] + replacement + body[m.end():]
+    else:
+        # Match Steam's normal indentation using the first key in this app block.
+        first = re.search(r'(?m)^([ \t]+)"', body)
+        indent = first.group(1) if first else '\t\t\t\t\t\t'
+        insertion = f'\n{indent}"LaunchOptions"\t\t"{escaped}"'
+        body = body.rstrip('\n') + insertion + '\n'
+
+new = s[:app_open] + body + s[app_close:]
+tmp = p.with_name(p.name + '.dtagnan-tmp')
+tmp.write_text(new, errors='surrogateescape')
+os.chmod(tmp, stat.S_IMODE(p.stat().st_mode))
+tmp.replace(p)
+PYVDF
+}
+
+transform_steam_launch_options() {
+  local mode="$1" mod_options="${2:-}" user_options="${3:-}"
+  python3 - "$mode" "$mod_options" "$user_options" <<'PYMERGE'
+import re
+import shlex
+import sys
+
+mode, mod_options, user_options = sys.argv[1:4]
+managed = {
+    'ENABLE_VKBASALT',
+    'VK_INSTANCE_LAYERS',
+    'VKBASALT_CONFIG_FILE',
+    'WINEDLLOVERRIDES',
+    '__NV_PRIME_RENDER_OFFLOAD',
+    '__VK_LAYER_NV_optimus',
+}
+
+def split(value):
+    lexer = shlex.shlex(value, posix=True, punctuation_chars='();<>|&')
+    lexer.whitespace_split = True
+    lexer.commenters = ''
+    return list(lexer)
+
+def is_managed_assignment(token):
+    if '=' not in token:
+        return False
+    return token.split('=', 1)[0] in managed
+
+try:
+    mod_tokens = split(mod_options)
+    user_tokens = split(user_options)
+except ValueError as exc:
+    raise SystemExit(f'Unable to parse existing Steam Launch Options safely: {exc}')
+
+mod_prefix = [t for t in mod_tokens if t != '%command%']
+clean_user = [t for t in user_tokens if not is_managed_assignment(t)]
+
+if mode == 'strip':
+    seen_command = False
+    tokens = []
+    for token in clean_user:
+        if token == '%command%':
+            if seen_command:
+                continue
+            seen_command = True
+        tokens.append(token)
+elif mode != 'merge':
+    raise SystemExit(f'Invalid Launch Options transform mode: {mode}')
+
+if mode == 'merge':
+    if '%command%' in clean_user:
+        command_at = clean_user.index('%command%')
+        user_prefix = [t for t in clean_user[:command_at] if t != '%command%']
+        user_suffix = [t for t in clean_user[command_at + 1:] if t != '%command%']
+    else:
+        user_prefix = clean_user
+        user_suffix = []
+    tokens = mod_prefix + user_prefix + ['%command%'] + user_suffix
+operators = re.compile(r'^[();<>|&]+$')
+
+def render(token):
+    # Keep real shell operators operational; quote all ordinary tokens safely.
+    if operators.fullmatch(token):
+        return token
+    if re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', token):
+        name, value = token.split('=', 1)
+        return f'{name}={shlex.quote(value)}'
+    return shlex.quote(token)
+
+sys.stdout.write(' '.join(render(token) for token in tokens))
+PYMERGE
+}
+
+merge_steam_launch_options() {
+  transform_steam_launch_options merge "$1" "${2:-}"
+}
+
+strip_managed_steam_launch_options() {
+  transform_steam_launch_options strip "" "$1"
+}
+
+configure_steam_launch_options() {
+  local game_dir="$1" localconfig status previous mod_options options
+  local saved_localconfig saved_previous installed current_status current base
+  local steam_state_content user_baseline user_changed=0
+
+  wait_for_steam_exit
+
+  localconfig="$(find_active_localconfig "$game_dir")" || \
+    die "Steam user configuration (localconfig.vdf) could not be found. Start Steam once, exit it completely, then run the installer again."
+
+  mod_options="$(build_launch_options)"
+  mod_options="${mod_options%$'\n'}"
+
+  mapfile -t _steam_old < <(steam_vdf_launch_options get "$localconfig")
+  current_status="${_steam_old[0]:-absent}"
+  current=""
+  if [[ "$current_status" == "present" ]]; then
+    current="$(printf '%s\n' "${_steam_old[@]:1}")"
+    current="${current%$'\n'}"
+  fi
+
+  # On updates, preserve the backup captured by the first installation.
+  if [[ -f "$STEAM_STATE" ]]; then
+    saved_localconfig="$(sed -n 's/^localconfig=//p' "$STEAM_STATE" | head -n1)"
+    [[ "$saved_localconfig" == "$localconfig" ]] || \
+      die "The active Steam account changed since the first installation. Restore the mod with the original account first, then install it for the new account."
+
+    # If the installed value is untouched, rebuild from the user's original
+    # options. If it changed, treat the current value as the new user input and
+    # merge it after removing variables managed by the mod.
+    base="$current"
+    if [[ -f "$STEAM_OPTIONS_INSTALLED" ]]; then
+      installed="$(cat -- "$STEAM_OPTIONS_INSTALLED")"
+      if [[ "$current_status" == "present" && "$current" == "$installed" ]]; then
+        saved_previous="$(sed -n 's/^previous=//p' "$STEAM_STATE" | head -n1)"
+        if [[ "$saved_previous" == "present" ]]; then
+          [[ -f "$STEAM_OPTIONS_BACKUP" ]] || die "Saved Steam Launch Options are missing."
+          base="$(cat -- "$STEAM_OPTIONS_BACKUP")"
+        else
+          base=""
+        fi
+      else
+        user_changed=1
+      fi
+    fi
+
+    # Commands added after the first installation become the new restoration
+    # baseline. Strip only variables owned by the mod before saving that state.
+    if (( user_changed )); then
+      user_baseline=""
+      if [[ "$current_status" == "present" ]]; then
+        user_baseline="$(strip_managed_steam_launch_options "$current")" || \
+          die "Changed Steam Launch Options could not be inspected safely."
+      fi
+
+      if [[ -z "$user_baseline" || "$user_baseline" == "%command%" ]]; then
+        saved_previous="absent"
+        rm -f -- "$STEAM_OPTIONS_BACKUP"
+      else
+        saved_previous="present"
+        write_text_atomic "$STEAM_OPTIONS_BACKUP" "$user_baseline"
+      fi
+      printf -v steam_state_content 'localconfig=%s\nprevious=%s\n' \
+        "$localconfig" "$saved_previous"
+      write_text_atomic "$STEAM_STATE" "$steam_state_content"
+    fi
+
+    options="$(merge_steam_launch_options "$mod_options" "$base")" || \
+      die "Existing Steam Launch Options could not be merged safely."
+    steam_vdf_launch_options set "$localconfig" "$options"
+    write_text_atomic "$STEAM_OPTIONS_INSTALLED" "$options"
+    success "Steam configuration updated automatically for No More Heroes."
+    return 0
+  fi
+
+  status="$current_status"
+  previous=""
+  if [[ "$status" == "present" ]]; then
+    previous="$current"
+    write_text_atomic "$STEAM_OPTIONS_BACKUP" "$previous"
+  else
+    rm -f -- "$STEAM_OPTIONS_BACKUP"
+  fi
+
+  # Commit restoration metadata before touching Steam's configuration.
+  printf -v steam_state_content 'localconfig=%s\nprevious=%s\n' \
+    "$localconfig" "$status"
+  write_text_atomic "$STEAM_STATE" "$steam_state_content"
+
+  options="$(merge_steam_launch_options "$mod_options" "$previous")" || \
+    die "Existing Steam Launch Options could not be merged safely."
+  steam_vdf_launch_options set "$localconfig" "$options"
+  write_text_atomic "$STEAM_OPTIONS_INSTALLED" "$options"
+  success "Steam configuration installed automatically for No More Heroes."
+}
+
+restore_steam_launch_options() {
+  local mode="${1:-interactive}"
+  local localconfig previous_state previous installed current_status current cleaned
+  [[ -f "$STEAM_STATE" ]] || return 0
+
+  localconfig="$(sed -n 's/^localconfig=//p' "$STEAM_STATE" | head -n1)"
+  previous_state="$(sed -n 's/^previous=//p' "$STEAM_STATE" | head -n1)"
+  [[ -n "$localconfig" && -f "$localconfig" ]] || {
+    warning "Steam configuration backup exists, but localconfig.vdf could not be found."
+    return 1
+  }
+
+  case "$mode" in
+    interactive)
+      wait_for_steam_exit
+      ;;
+    noninteractive)
+      if steam_process_running; then
+        warning "Steam is still running. Steam Launch Options were left unchanged and their recovery metadata was preserved."
+        return 1
+      fi
+      ;;
+    *)
+      die "Invalid Steam restoration mode: $mode"
+      ;;
+  esac
+
+  previous=""
+  if [[ "$previous_state" == "present" ]]; then
+    [[ -f "$STEAM_OPTIONS_BACKUP" ]] || die "Saved Steam Launch Options are missing."
+    previous="$(cat -- "$STEAM_OPTIONS_BACKUP")"
+  fi
+
+  mapfile -t _steam_current < <(steam_vdf_launch_options get "$localconfig")
+  current_status="${_steam_current[0]:-absent}"
+  current=""
+  if [[ "$current_status" == "present" ]]; then
+    current="$(printf '%s\n' "${_steam_current[@]:1}")"
+    current="${current%$'\n'}"
+  fi
+
+  # A user or another tool may have edited Launch Options after installation.
+  # Never overwrite that newer value silently. An already-restored value is
+  # accepted so recovery remains idempotent after a previous interruption.
+  if [[ "$previous_state" == "absent" && "$current_status" == "absent" ]] ||
+     [[ "$previous_state" == "present" && "$current_status" == "present" &&
+        "$current" == "$previous" ]]; then
+    rm -f -- "$STEAM_STATE" "$STEAM_OPTIONS_BACKUP" "$STEAM_OPTIONS_INSTALLED"
+    success "Steam Launch Options were already restored."
+    return 0
+  fi
+
+  if [[ -f "$STEAM_OPTIONS_INSTALLED" ]]; then
+    installed="$(cat -- "$STEAM_OPTIONS_INSTALLED")"
+    if [[ "$current_status" != "present" || "$current" != "$installed" ]]; then
+      if [[ "$current_status" == "present" ]]; then
+        cleaned="$(strip_managed_steam_launch_options "$current")" || {
+          warning "Changed Steam Launch Options could not be inspected safely and were left untouched."
+          warning "Steam recovery metadata was preserved for manual review."
+          return 2
+        }
+        if [[ -z "$cleaned" || "$cleaned" == "%command%" ]]; then
+          steam_vdf_launch_options remove "$localconfig"
+        else
+          steam_vdf_launch_options set "$localconfig" "$cleaned"
+        fi
+      fi
+      rm -f -- "$STEAM_STATE" "$STEAM_OPTIONS_BACKUP" "$STEAM_OPTIONS_INSTALLED"
+      success "User-modified Steam Launch Options were preserved and Dtagnan Mods variables were removed."
+      return 0
+    fi
+  fi
+
+  case "$previous_state" in
+    present)
+      steam_vdf_launch_options set "$localconfig" "$previous"
+      success "Previous Steam Launch Options restored."
+      ;;
+    absent)
+      steam_vdf_launch_options remove "$localconfig"
+      success "Mod-created Steam Launch Options removed."
+      ;;
+    *)
+      die "Invalid Steam Launch Options backup state."
+      ;;
+  esac
+
+  rm -f -- "$STEAM_STATE" "$STEAM_OPTIONS_BACKUP" "$STEAM_OPTIONS_INSTALLED"
+}
+
 build_launch_options() {
   local gpu config_quoted
   gpu="$(detect_gpu_vendor)"
@@ -1135,6 +1657,12 @@ install_mod() {
   check_vulkan_loader "$game_dir"
   check_vkbasalt "$game_dir"
 
+  # Steam must be closed before the installation transaction starts. This
+  # keeps Ctrl+C/TERM during the prompt completely side-effect free and avoids
+  # an interactive wait from ever being entered by rollback cleanup.
+  wait_for_steam_exit
+  acquire_operation_lock
+
   note "Game detected: $game_dir"
   mkdir -p -- "$SHADER_DIR" "$TEXTURE_DIR" "$LUT_DIR" "$BACKUP_DIR"
   cleanup_stale_install_files "$game_dir"
@@ -1153,14 +1681,16 @@ install_mod() {
   install_atomic "$ROOT/DXVK/dxgi.dll" "$game_dir/dxgi.dll"
   write_config
 
+  verify_mod "$game_dir"
+  configure_steam_launch_options "$game_dir"
+
   success "Installation completed"
   printf '\n  %-15s %s\n' 'Configuration:' "$CONFIG_FILE"
   printf '  %-15s %s\n' 'Assets:' "$RUNTIME_DIR"
   printf '  %-15s %s\n' 'Toggle key:' 'F10'
-  show_launch_options "$game_dir"
-
-  verify_mod "$game_dir"
+  printf '  %-15s %s\n' 'Steam setup:' 'Automatic — no copy/paste required'
   INSTALL_TRANSACTION_ACTIVE=0
+  release_operation_lock
 }
 
 verify_mod() {
@@ -1213,6 +1743,20 @@ restore_vanilla() {
 
   need_file "$BACKUP_STATE"
 
+  # Close Steam before changing either Steam configuration or game files.
+  # Restore Steam first; if that cannot be completed, all game backups remain
+  # untouched and the uninstall can be retried safely.
+  wait_for_steam_exit
+  acquire_operation_lock
+  local steam_restore_rc=0
+  set +e
+  restore_steam_launch_options
+  steam_restore_rc=$?
+  set -e
+  if (( steam_restore_rc == 1 )); then
+    die "Steam Launch Options could not be restored. No game files were changed."
+  fi
+
   note "Restoring original DLLs"
   for current in d3d11.dll dxgi.dll; do
     if state_has "$current=present"; then
@@ -1263,37 +1807,31 @@ EOF
 
   rm -f -- "$BACKUP_DIR/d3d11.dll" "$BACKUP_DIR/dxgi.dll" \
     "$BACKUP_STATE" "$CONFIG_BACKUP"
+  release_operation_lock
   rmdir -- "$SHADER_DIR" "$TEXTURE_DIR" "$LUT_DIR" "$BACKUP_DIR" \
     "$RUNTIME_DIR" 2>/dev/null || true
 
   success "Original DLLs restored to: $game_dir"
   success "Dtagnan Mods files removed."
-  warning "Remember to remove the mod launch options from Steam."
 }
 
-show_launch_options() {
-  local game_dir="${1:-}" gpu
-  if [[ -z "$game_dir" ]]; then
-    game_dir="$(find_game_dir)"
-    configure_install_scope "$game_dir"
-  fi
-  gpu="$(detect_gpu_vendor)"
+show_steam_configuration() {
+  local game_dir="${1:-}" localconfig options
+  [[ -n "$game_dir" ]] || game_dir="$(find_game_dir)"
+  configure_install_scope "$game_dir"
+  localconfig="$(find_active_localconfig "$game_dir" || true)"
+  options="$(build_launch_options)"
   print_rule
   cat <<EOF
-  STEAM LAUNCH OPTIONS
+  AUTOMATIC STEAM CONFIGURATION
 
-ENABLE_VKBASALT=1 enables the vkBasalt Vulkan post-processing layer.
-VKBASALT_CONFIG_FILE tells vkBasalt to load the NMH-specific profile.
-WINEDLLOVERRIDES forces Proton to use the custom DXVK DLLs in the game folder.
+Dtagnan Mods writes the required per-game environment to Steam automatically.
+You do not need to copy or paste Launch Options manually.
 
-Detected GPU profile: $gpu
-NVIDIA PRIME variables are added only on hybrid NVIDIA systems.
-AMD and Intel systems receive clean vendor-neutral options.
-
-Copy this entire line into the game's Steam Launch Options:
-
+Required configuration:
+$options
 EOF
-  build_launch_options
+  [[ -n "$localconfig" ]] && printf 'Steam config: %s\n' "$localconfig"
   printf '\n'
 }
 
@@ -1373,6 +1911,81 @@ This package improves No More Heroes on Linux in two separate stages:
 
 The F10 key toggles all post-processing effects on or off while playing.
 
+What changes in the game
+------------------------
+Frame delivery is made more consistent by the NMH-specific DXVK profile. The
+one-frame latency limit reduces queued input, while present timing and the
+shader compiler settings target smoother frame pacing and fewer compilation
+stutters. Vulkan replaces the Direct3D 11 path used through Proton.
+
+The visual treatment remains intentionally restrained: SMAA reduces visible
+jagged edges, the LUT refines color and midtones, bloom softens bright areas,
+vignette guides attention toward the image, CAS restores controlled detail,
+and dithering reduces banding. F10 provides an immediate original-versus-mod
+comparison without uninstalling anything.
+
+Automatic Steam configuration
+-----------------------------
+The installer injects the required Launch Options directly into Steam. No
+custom command or copy/paste step is required. Existing unrelated commands are
+preserved, while variables managed by Dtagnan Mods are deduplicated.
+
+Built-in automated functions
+----------------------------
+Installer / Updater
+  Finds the game and Steam backend, checks dependencies, creates recovery
+  backups, installs the files atomically and configures Steam. Running it again
+  updates the mod without discarding the original backup.
+
+Launch Options Inspector
+  Reads the active Steam account's No More Heroes options. User commands such
+  as gamemoderun, mangohud and Gamescope are combined with the mod. Identical
+  or conflicting mod variables are reduced to one correct value, and only one
+  %command% is retained. User additions are preserved during restoration.
+
+System Doctor
+  Performs a read-only check of the platform, Steam backend, game location,
+  GPU, 32-bit Vulkan, 32-bit vkBasalt, write access and packaged files.
+
+Verifier
+  Checks the installed DLLs, shaders, LUT, configuration, dependencies and
+  recovery metadata without changing them.
+
+Crash recovery and operation lock
+  Atomic writes and automatic rollback protect interrupted installations. A
+  per-user lock prevents concurrent operations and stale locks are recovered.
+
+Restore / Uninstaller
+  Restores original DLLs and Steam settings. If Launch Options were edited
+  after installation, only values managed by Dtagnan Mods are removed.
+
+Dependency Test and Comparison Viewer
+  Dependency Test safely exercises supported package-manager paths in dry-run
+  mode. Comparison Viewer displays the included before/after images.
+
+Package integrity
+  Known hashes protect the custom DXVK payload and comparison images. The
+  Verifier also compares every installed shader, LUT and configuration entry.
+
+Steam and hardware detection
+  Native Steam, Steam Flatpak, registered extra libraries and Steam Deck
+  microSD storage are discovered automatically. GPU detection adds NVIDIA
+  PRIME variables only on hybrid NVIDIA systems. Custom XDG directories and
+  paths containing spaces or Unicode are supported.
+
+Simple installation
+-------------------
+1. Extract the complete release and open a terminal in its directory.
+2. Run: chmod +x install.sh
+3. Run: ./install.sh
+4. Choose "Install or update the mod" and follow the prompts.
+5. Reopen Steam and launch the game normally. Do not add a custom Launch
+   Options command; the Inspector has already configured it automatically.
+
+Steam Deck: use Desktop Mode, run as the normal deck user, keep the microSD
+library registered in Steam, and close Steam completely when prompted. The
+installer never unlocks or modifies the immutable SteamOS system image.
+
 Native Steam locations
 ----------------------
 Custom DXVK DLLs:  the No More Heroes game directory
@@ -1392,10 +2005,6 @@ ENABLE_VKBASALT=1 does not install vkBasalt. It tells Vulkan to enable the
 already-installed vkBasalt layer when No More Heroes starts.
 EOF
 }
-
-
-
-
 
 test_dependencies() {
   local dependency="${DTAGNAN_TEST_MISSING:-}"
@@ -1812,7 +2421,7 @@ main_menu() {
     printf '\n'
     printf '     %s[1]%s ❤ Install / Update\n' "$CYAN" "$RESET"
     printf '     %s[2]%s ✓ Verify installation\n' "$CYAN" "$RESET"
-    printf '     %s[3]%s 🎮 Show Steam launch options\n' "$CYAN" "$RESET"
+    printf '     %s[3]%s 🎮 Show automatic Steam setup\n' "$CYAN" "$RESET"
     printf '     %s[4]%s 🗑️ Uninstall the mod\n' "$CYAN" "$RESET"
     printf '     %s[5]%s ✦ About this mod\n' "$CYAN" "$RESET"
     printf '     %s[6]%s 🚪 Exit\n' "$CYAN" "$RESET"
@@ -1825,7 +2434,7 @@ main_menu() {
     case "$choice" in
       1) install_mod; pause_menu ;;
       2) verify_mod; pause_menu ;;
-      3) show_launch_options; pause_menu ;;
+      3) show_steam_configuration; pause_menu ;;
       4) confirm_restore; pause_menu ;;
       5) show_about; pause_menu ;;
       6)
@@ -1847,7 +2456,7 @@ Usage:
   ./install.sh install [game-directory]    Install or update the mod
   ./install.sh verify  [game-directory]    Verify the installation
   ./install.sh restore [game-directory]    Restore the original DLLs
-  ./install.sh options                     Show Steam launch options
+  ./install.sh options                     Show automatic Steam configuration
   ./install.sh about                       Explain what the mod installs
   ./install.sh compare                     Show the before / after comparison
   ./install.sh doctor                      Run a read-only system diagnostic
@@ -1862,7 +2471,7 @@ case "$ACTION" in
   install) install_mod ;;
   verify)  verify_mod ;;
   restore) restore_vanilla ;;
-  options) show_launch_options ;;
+  options) show_steam_configuration ;;
   about)   show_about ;;
   compare) show_comparison ;;
   doctor)  doctor ;;
