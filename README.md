@@ -14,7 +14,7 @@
 
 **Custom DXVK build · SMAA · Color LUT · Bloom · Vignette · CAS · Dithering**
 
-**Installer version 1.1.3**
+**Installer version 1.0**
 
 </div>
 
