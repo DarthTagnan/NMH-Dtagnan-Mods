@@ -1,11 +1,6 @@
-```text
- DDDD  TTTTT  AAA   GGG  N   N  AAA  N   N    M   M  OOO  DDDD  SSSS
- D   D   T   A   A G     NN  N A   A NN  N    MM MM O   O D   D S
- D   D   T   AAAAA G  GG N N N AAAAA N N N    M M M O   O D   D SSS
- D   D   T   A   A G   G N  NN A   A N  NN    M   M O   O D   D    S
- DDDD    T   A   A  GGG  N   N A   A N   N    M   M  OOO  DDDD  SSSS
-```
-
+<p align="center">
+  <img src="assets/dtagnan-mods-banner.png" alt="Dtagnan Mods" width="100%">
+</p>
 <div align="center">
 
 # Dtagnan Mods — No More Heroes
