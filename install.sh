@@ -93,14 +93,55 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
 }
 
+detect_platform() {
+  PLATFORM="linux"
+  PLATFORM_NAME="Linux"
+
+  OS_ID=""
+  OS_ID_LIKE=""
+  OS_NAME=""
+  OS_VARIANT_ID=""
+
+  if [[ -r /etc/os-release ]]; then
+    OS_ID="$(sed -n 's/^ID=//p' /etc/os-release | head -n1 | tr -d '"')"
+    OS_ID_LIKE="$(sed -n 's/^ID_LIKE=//p' /etc/os-release | head -n1 | tr -d '"')"
+    OS_NAME="$(sed -n 's/^NAME=//p' /etc/os-release | head -n1 | tr -d '"')"
+    OS_VARIANT_ID="$(sed -n 's/^VARIANT_ID=//p' /etc/os-release | head -n1 | tr -d '"')"
+
+    [[ -n "$OS_NAME" ]] && PLATFORM_NAME="$OS_NAME"
+
+    # SteamOS must be identified before any generic Arch-family logic.
+    if [[ "$OS_ID" == "steamos" ]] ||
+       [[ "$OS_VARIANT_ID" == "steamdeck" ]] ||
+       [[ "$OS_NAME" == *"SteamOS"* ]]; then
+      PLATFORM="steamdeck"
+      PLATFORM_NAME="Steam Deck / SteamOS"
+      return 0
+    fi
+  fi
+
+  # Conservative fallback for Steam Deck installations where
+  # /etc/os-release does not provide the expected SteamOS markers.
+  if [[ "$HOME" == "/home/deck" &&
+        -d "$HOME/.local/share/Steam" &&
+        -x /usr/bin/steamos-readonly ]]; then
+    PLATFORM="steamdeck"
+    PLATFORM_NAME="Steam Deck / SteamOS"
+  fi
+}
+
+
 preflight() {
   [[ "$(uname -s)" == "Linux" ]] || die "This mod supports Linux only."
+
+  detect_platform
+
   if (( EUID == 0 )) && [[ "${DTAGNAN_ALLOW_ROOT:-0}" != "1" ]]; then
     die "Do not run this installer with sudo or as root. Run it as your normal Steam user."
   fi
 
   local command
-  for command in realpath install cmp sed grep awk sha256sum file find head cp mv rm mkdir chmod uname; do
+  for command in realpath install cmp sed grep awk sha256sum file head cp mv rm mkdir chmod uname; do
     require_command "$command"
   done
 }
@@ -126,20 +167,99 @@ install_atomic() {
 
 cleanup_stale_install_files() {
   local target stale
+  local -a stale_files=()
 
   for target in "$1" "$RUNTIME_DIR" "$CONFIG_DIR"; do
     [[ -d "$target" ]] || continue
-    while IFS= read -r -d '' stale; do
+
+    stale_files=()
+
+    shopt -s nullglob
+    stale_files+=(
+      "$target"/*.dtagnan-tmp.*
+      "$target"/install-state.tmp.*
+    )
+    shopt -u nullglob
+
+    for stale in "${stale_files[@]}"; do
+      [[ -f "$stale" || -L "$stale" ]] || continue
       rm -f -- "$stale"
-    done < <(find "$target" -type f \( \
-      -name '*.dtagnan-tmp.*' -o \
-      -name 'install-state.tmp.*' \
-    \) -print0 2>/dev/null)
+    done
   done
+}
+
+steam_backend_for_game() {
+  local game_dir="$1"
+  local backend steam_root library_file path
+  local -a entries=(
+    "native|$HOME/.local/share/Steam"
+    "native|$HOME/.local/share/steam"
+    "native|$HOME/.steam/steam"
+    "native|$HOME/.steam/root"
+    "native|$HOME/.steam/debian-installation"
+    "native|${XDG_DATA_HOME:-$HOME/.local/share}/Steam"
+    "native|${XDG_DATA_HOME:-$HOME/.local/share}/steam"
+
+    "flatpak|$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"
+    "flatpak|$HOME/.var/app/com.valvesoftware.Steam/.local/share/steam"
+    "flatpak|$HOME/.var/app/com.valvesoftware.Steam/data/Steam"
+    "flatpak|$HOME/.var/app/com.valvesoftware.Steam/data/steam"
+
+    "snap|$HOME/snap/steam/common/.local/share/Steam"
+  )
+
+  [[ -n "$game_dir" ]] || {
+    printf 'unknown\n'
+    return
+  }
+
+  game_dir="$(realpath -m -- "$game_dir")"
+
+  for entry in "${entries[@]}"; do
+    backend="${entry%%|*}"
+    steam_root="${entry#*|}"
+
+    [[ -d "$steam_root/steamapps" ]] || continue
+
+    steam_root="$(realpath -m -- "$steam_root")"
+
+    # Game stored directly in this Steam installation.
+    if [[ "$game_dir" == "$steam_root/steamapps/common/"* ]]; then
+      printf '%s\n' "$backend"
+      return
+    fi
+
+    # Game stored in an additional library registered by this Steam
+    # installation, including external disks and Steam Deck microSD.
+    library_file="$steam_root/steamapps/libraryfolders.vdf"
+    [[ -f "$library_file" ]] || continue
+
+    while IFS= read -r path; do
+      path="${path//\\\\/\\}"
+      [[ -n "$path" ]] || continue
+
+      path="$(realpath -m -- "$path")"
+
+      if [[ "$game_dir" == "$path/steamapps/common/"* ]]; then
+        printf '%s\n' "$backend"
+        return
+      fi
+    done < <(
+      sed -n 's/^[[:space:]]*"path"[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$library_file"
+    )
+  done
+
+  printf 'unknown\n'
 }
 
 find_game_dir() {
   local candidate manifest steamapps installdir steam_root library_file path
+  local manual_steam_root=""
+  local steam_found=0
+  local canonical=""
+  local seen=""
+  local interactive="${DTAGNAN_GAME_DETECTION_INTERACTIVE:-1}"
   local -a steam_roots=()
   local -a steamapps_dirs=()
 
@@ -150,70 +270,165 @@ find_game_dir() {
     return
   fi
 
-  steam_roots+=(
+  steam_roots=(
+    # Native Steam
     "$HOME/.local/share/Steam"
+    "$HOME/.local/share/steam"
     "$HOME/.steam/steam"
     "$HOME/.steam/root"
+    "$HOME/.steam/debian-installation"
     "${XDG_DATA_HOME:-$HOME/.local/share}/Steam"
+    "${XDG_DATA_HOME:-$HOME/.local/share}/steam"
+
+    # Flatpak Steam
+    "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"
+    "$HOME/.var/app/com.valvesoftware.Steam/.local/share/steam"
     "$HOME/.var/app/com.valvesoftware.Steam/data/Steam"
+    "$HOME/.var/app/com.valvesoftware.Steam/data/steam"
+
+    # Snap Steam
+    "$HOME/snap/steam/common/.local/share/Steam"
   )
 
-  for steam_root in "${steam_roots[@]}"; do
-    [[ -d "$steam_root/steamapps" ]] || continue
-    steamapps_dirs+=("$steam_root/steamapps")
-    library_file="$steam_root/steamapps/libraryfolders.vdf"
-    [[ -f "$library_file" ]] || continue
+  # Register a Steam library only once.
+  add_steamapps_dir() {
+    local dir="$1" normalized
+
+    [[ -d "$dir" ]] || return 0
+
+    normalized="$(realpath -m -- "$dir")"
+
+    case $'\n'"$seen"$'\n' in
+      *$'\n'"$normalized"$'\n'*)
+        return 0
+        ;;
+    esac
+
+    seen+="${seen:+$'\n'}$normalized"
+    steamapps_dirs+=("$normalized")
+  }
+
+  # Read one Steam installation and all libraries registered in its
+  # libraryfolders.vdf. No filesystem scanning is performed.
+  read_steam_root() {
+    local root="$1" root_real library path
+
+    [[ -d "$root/steamapps" ]] || return 1
+
+    root_real="$(realpath -m -- "$root")"
+    steam_found=1
+
+    add_steamapps_dir "$root_real/steamapps"
+
+    library="$root_real/steamapps/libraryfolders.vdf"
+    [[ -f "$library" ]] || return 0
 
     while IFS= read -r path; do
       path="${path//\\\\/\\}"
-      [[ -d "$path/steamapps" ]] && steamapps_dirs+=("$path/steamapps")
-    done < <(sed -n 's/^[[:space:]]*"path"[[:space:]]*"\([^"]*\)".*/\1/p' "$library_file")
+      [[ -n "$path" ]] || continue
+      add_steamapps_dir "$path/steamapps"
+    done < <(
+      sed -n 's/^[[:space:]]*"path"[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$library"
+    )
+  }
+
+  # Check the standard Steam locations first. realpath normalization
+  # prevents aliases such as ~/.steam/root and ~/.steam/steam from
+  # causing the same installation to be processed repeatedly.
+  seen=""
+
+  for steam_root in "${steam_roots[@]}"; do
+    [[ -d "$steam_root/steamapps" ]] || continue
+
+    canonical="$(realpath -m -- "$steam_root")"
+
+    case $'\n'"$seen"$'\n' in
+      *$'\n'"ROOT:$canonical"$'\n'*)
+        continue
+        ;;
+    esac
+
+    seen+="${seen:+$'\n'}ROOT:$canonical"
+    read_steam_root "$canonical" || true
   done
 
+  # If Steam itself was not found, ask for its installation directory
+  # before asking for the game directory.
+  if (( ! steam_found )) && [[ "$interactive" == "1" ]] && [[ -t 0 ]]; then
+    printf '\n  %sSteam could not be found in its usual locations.%s\n' \
+      "$YELLOW" "$RESET" >/dev/tty
+    printf '  Have you moved your Steam installation?\n' >/dev/tty
+    printf '  Please enter the path to your Steam folder (or leave blank to cancel): ' \
+      >/dev/tty
+
+    IFS= read -r manual_steam_root </dev/tty
+
+    [[ -n "$manual_steam_root" ]] || die "Installation cancelled."
+
+    manual_steam_root="${manual_steam_root%/}"
+
+    [[ -d "$manual_steam_root/steamapps" ]] || \
+      die "This does not appear to be a Steam folder: $manual_steam_root"
+
+    read_steam_root "$manual_steam_root" || \
+      die "Unable to read the Steam installation: $manual_steam_root"
+  fi
+
+  # Locate NMH by AppID instead of relying on a fixed directory name.
   for steamapps in "${steamapps_dirs[@]}"; do
     manifest="$steamapps/appmanifest_${APP_ID}.acf"
     [[ -f "$manifest" ]] || continue
-    installdir="$(sed -n 's/.*"installdir"[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" | head -n 1)"
+
+    installdir="$(
+      sed -n 's/.*"installdir"[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$manifest" |
+        head -n 1
+    )"
+
+    [[ -n "$installdir" ]] || continue
+
     candidate="$steamapps/common/$installdir"
+
     if [[ -f "$candidate/nmh.exe" ]]; then
       realpath -e -- "$candidate"
       return
     fi
   done
 
-  candidate=""
-  if [[ -t 0 ]]; then
-    printf '\n  %sGame not detected automatically.%s\n' "$YELLOW" "$RESET" >/dev/tty
-    printf '  Enter the full No More Heroes directory (or leave blank to cancel): ' >/dev/tty
+  # Steam exists, but NMH was not found in any registered library.
+  if [[ "$interactive" == "1" ]] && [[ -t 0 ]]; then
+    printf '\n  %sSteam was detected, but No More Heroes could not be found in any configured Steam library.%s\n' \
+      "$YELLOW" "$RESET" >/dev/tty
+    printf '  Have you moved the game or its Steam library?\n' >/dev/tty
+    printf '  Please enter the path to your No More Heroes installation (or leave blank to cancel): ' \
+      >/dev/tty
+
     IFS= read -r candidate </dev/tty
-    if [[ -n "$candidate" && -f "$candidate/nmh.exe" ]]; then
-      realpath -e -- "$candidate"
-      return
-    fi
+
+    [[ -n "$candidate" ]] || die "Installation cancelled."
+
+    candidate="${candidate%/}"
+
+    [[ -f "$candidate/nmh.exe" ]] || \
+      die "nmh.exe was not found in: $candidate"
+
+    realpath -e -- "$candidate"
+    return
   fi
 
-  die "Steam installation not found. Use: ./install.sh install '/path/to/No More Heroes'"
-}
+  if (( steam_found )); then
+    die "No More Heroes was not found in the configured Steam libraries."
+  fi
 
-is_flatpak_game() {
-  local game_dir="$1" library_file path
-
-  [[ "${DTAGNAN_STEAM_FLATPAK:-0}" == "1" ]] && return 0
-  [[ "$game_dir" == "$HOME/.var/app/com.valvesoftware.Steam/"* ]] && return 0
-
-  library_file="$HOME/.var/app/com.valvesoftware.Steam/data/Steam/steamapps/libraryfolders.vdf"
-  [[ -f "$library_file" ]] || return 1
-
-  while IFS= read -r path; do
-    path="${path//\\\\/\\}"
-    [[ "$game_dir" == "$path/steamapps/common/"* ]] && return 0
-  done < <(sed -n 's/^[[:space:]]*"path"[[:space:]]*"\([^"]*\)".*/\1/p' "$library_file")
-
-  return 1
+  die "Steam was not found in its usual locations."
 }
 
 configure_install_scope() {
   local game_dir="$1"
+  local steam_backend
+
+  steam_backend="$(steam_backend_for_game "$game_dir")"
 
   DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
   CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -222,7 +437,7 @@ configure_install_scope() {
   CONFIG_FILE="$CONFIG_DIR/nmh.conf"
   CONFIG_BACKUP="$CONFIG_DIR/nmh.conf.pre-dtagnan-mods"
 
-  if is_flatpak_game "$game_dir"; then
+  if [[ "$steam_backend" == "flatpak" ]]; then
     DATA_HOME="$HOME/.var/app/com.valvesoftware.Steam/data"
     CONFIG_HOME="$HOME/.var/app/com.valvesoftware.Steam/config"
     RUNTIME_DIR="$DATA_HOME/Dtagnan-Mods/No-More-Heroes"
@@ -260,86 +475,395 @@ check_package() {
   fi
 }
 
-check_vkbasalt() {
-  local game_dir="${1:-}" lib="" candidate
-  local -a candidates=()
 
-  if [[ -n "$game_dir" ]] && is_flatpak_game "$game_dir"; then
-    command -v flatpak >/dev/null 2>&1 || \
-      die "Flatpak Steam was detected, but the flatpak command is unavailable."
+detect_package_manager() {
+  # Development/testing override. Never used unless explicitly requested.
+  if [[ -n "${DTAGNAN_TEST_PM:-}" ]]; then
+    case "$DTAGNAN_TEST_PM" in
+      steamos|dnf|apt|pacman|zypper|unknown)
+        printf '%s\n' "$DTAGNAN_TEST_PM"
+        return 0
+        ;;
+      *)
+        printf 'unknown\n'
+        return 0
+        ;;
+    esac
+  fi
 
-    if ! flatpak list --runtime --columns=application,arch 2>/dev/null | \
-         grep -i 'vkBasalt' | grep -qi 'i386'; then
-      die "Flatpak Steam needs a 32-bit vkBasalt Vulkan-layer extension inside its Flatpak runtime. Install it, then run this installer again."
-    fi
+  # SteamOS is intentionally handled before pacman. SteamOS uses an
+  # Arch-based system, but it must not inherit the generic Arch package
+  # installation path.
+  if [[ "${PLATFORM:-}" == "steamdeck" ]]; then
+    printf 'steamos\n'
+    return 0
+  fi
 
-    success "Flatpak Steam and a vkBasalt runtime extension were detected."
+  if command -v dnf >/dev/null 2>&1; then
+    printf 'dnf\n'
+  elif command -v apt-get >/dev/null 2>&1; then
+    printf 'apt\n'
+  elif command -v pacman >/dev/null 2>&1; then
+    printf 'pacman\n'
+  elif command -v zypper >/dev/null 2>&1; then
+    printf 'zypper\n'
+  else
+    printf 'unknown\n'
+  fi
+}
+
+confirm_dependency_install() {
+  local description="$1"
+  local answer=""
+
+  # Non-interactive runs must never modify the system automatically.
+  [[ -t 0 ]] || return 1
+
+  printf '\n  %s%s[DEPENDENCY]%s %s is missing.%s\n' \
+    "$BOLD" "$YELLOW" "$RESET" "$description" "$RESET" >/dev/tty
+
+  printf '  Install it automatically now? [Y/n]: ' >/dev/tty
+  IFS= read -r answer </dev/tty
+
+  case "${answer,,}" in
+    ""|y|yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+run_privileged() {
+  if [[ "${DTAGNAN_DEPENDENCY_DRY_RUN:-0}" == "1" ]]; then
+    printf '  DRY RUN:'
+    printf ' %q' "$@"
+    printf '\n'
+    return 0
+  fi
+
+  # Already root: mainly useful for containers/testing.
+  if (( EUID == 0 )); then
+    "$@"
     return
   fi
 
+  if command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+    return
+  fi
+
+  if command -v pkexec >/dev/null 2>&1; then
+    pkexec "$@"
+    return
+  fi
+
+  die "Administrator privileges are required to install this dependency. Install it manually, then run Dtagnan Mods again."
+}
+
+install_native_dependency() {
+  local dependency="$1"
+  local pm
+
+  pm="$(detect_package_manager)"
+
+  case "$dependency:$pm" in
+    vulkan32:steamos)
+      warning "The SteamOS 32-bit Vulkan loader is missing."
+      warning "Dtagnan Mods will not modify the SteamOS system image automatically."
+      return 1
+      ;;
+
+    vkbasalt32:steamos)
+      warning "The SteamOS 32-bit vkBasalt layer is missing."
+      warning "Dtagnan Mods will not modify the SteamOS system image automatically."
+      return 1
+      ;;
+
+    vulkan32:dnf)
+      note "Installing the Fedora 32-bit Vulkan loader..."
+      run_privileged dnf install -y vulkan-loader.i686
+      ;;
+
+    vulkan32:apt)
+      note "Installing the Debian/Ubuntu 32-bit Vulkan loader..."
+      run_privileged dpkg --add-architecture i386
+      run_privileged apt-get update
+      run_privileged apt-get install -y libvulkan1:i386
+      ;;
+
+    vulkan32:pacman)
+      note "Installing the Arch Linux 32-bit Vulkan loader..."
+      run_privileged pacman -S --needed lib32-vulkan-icd-loader
+      ;;
+
+    vulkan32:zypper)
+      note "Installing the openSUSE 32-bit Vulkan loader..."
+      run_privileged zypper --non-interactive install libvulkan1-32bit
+      ;;
+
+    vkbasalt32:dnf)
+      note "Installing Fedora 32-bit vkBasalt..."
+      run_privileged dnf install -y vkBasalt.i686
+      ;;
+
+    vkbasalt32:apt)
+      warning "Automatic 32-bit vkBasalt installation is not configured for this Debian/Ubuntu system."
+      return 1
+      ;;
+
+    vkbasalt32:pacman)
+      warning "Automatic 32-bit vkBasalt installation is not configured for this Arch system."
+      return 1
+      ;;
+
+    vkbasalt32:zypper)
+      warning "Automatic 32-bit vkBasalt installation is not configured for this openSUSE system."
+      return 1
+      ;;
+
+    *)
+      warning "No automatic installation method is available for '$dependency' on this system."
+      return 1
+      ;;
+  esac
+
+  if [[ "${DTAGNAN_DEPENDENCY_DRY_RUN:-0}" == "1" ]]; then
+    return 2
+  fi
+}
+
+offer_dependency_install() {
+  local dependency="$1"
+  local description="$2"
+
+  if ! confirm_dependency_install "$description"; then
+    return 1
+  fi
+
+  install_native_dependency "$dependency"
+  local rc=$?
+
+  if (( rc == 2 )); then
+    success "Dependency installation path tested successfully (dry run)."
+    return 2
+  fi
+
+  return "$rc"
+}
+
+install_flatpak_vkbasalt_dependency() {
+  local runtime=""
+
+  command -v flatpak >/dev/null 2>&1 || return 1
+
+  # Discover an available vkBasalt extension instead of hard-coding
+  # a Steam runtime version.
+  runtime="$(
+    flatpak remote-ls --runtime --columns=ref 2>/dev/null |
+      grep -Ei 'vkBasalt' |
+      grep -Ei 'i386|x86_64' |
+      head -n 1 || true
+  )"
+
+  [[ -n "$runtime" ]] || return 1
+
+  if ! confirm_dependency_install "the Flatpak vkBasalt Vulkan layer"; then
+    return 1
+  fi
+
+  note "Installing Flatpak vkBasalt runtime extension..."
+  flatpak install -y flathub "$runtime"
+}
+
+find_vkbasalt32() {
+  local c
+  local -a candidates=()
+
+  # Developer/testing override.
+  [[ "${DTAGNAN_TEST_MISSING:-}" == "vkbasalt32" ]] && return 1
+
   candidates=(
-    "${VKBASALT_LIBRARY:-}" \
-    /usr/lib/vkbasalt/libvkbasalt.so \
-    /usr/lib32/libvkbasalt.so \
-    /usr/lib32/vkbasalt/libvkbasalt.so \
-    /usr/lib/i386-linux-gnu/libvkbasalt.so \
+    "${VKBASALT_LIBRARY:-}"
+    /usr/lib/vkbasalt/libvkbasalt.so
+    /usr/lib32/libvkbasalt.so
+    /usr/lib32/vkbasalt/libvkbasalt.so
+    /usr/lib/i386-linux-gnu/libvkbasalt.so
     /usr/lib/i386-linux-gnu/vkbasalt/libvkbasalt.so
+    /lib/libvkbasalt.so
+    /lib32/libvkbasalt.so
   )
 
-  while IFS= read -r candidate; do
-    candidates+=("$candidate")
-  done < <(find /usr/lib /usr/lib32 /lib /lib32 \
-    -maxdepth 4 -type f -o -type l 2>/dev/null | grep -E '/libvkbasalt\.so([.0-9]*)?$' || true)
+  # Some distributions register vkBasalt with the dynamic linker.
+  if command -v ldconfig >/dev/null 2>&1; then
+    while IFS= read -r c; do
+      candidates+=("$c")
+    done < <(
+      ldconfig -p 2>/dev/null |
+        awk '/libvkbasalt\.so/ { print $NF }'
+    )
+  fi
 
-  for candidate in "${candidates[@]}"; do
-    [[ -n "$candidate" && -f "$candidate" ]] || continue
-    if file -L "$candidate" | grep -qiE '32-bit|Intel 80386'; then
-      lib="$candidate"
-      break
+  for c in "${candidates[@]}"; do
+    [[ -n "$c" && -f "$c" ]] || continue
+
+    if file -L "$c" | grep -qiE '32-bit|Intel 80386'; then
+      printf '%s\n' "$c"
+      return 0
     fi
   done
 
-  [[ -n "$lib" ]] || die "32-bit vkBasalt was not found. Install the i686/32-bit vkBasalt package."
+  return 1
 }
 
-check_vulkan_loader() {
-  local game_dir="${1:-}" candidate loader=""
+find_vulkan32() {
+  local c
   local -a candidates=()
 
-  # Flatpak Steam supplies its own Vulkan loader through the runtime.
-  if [[ -n "$game_dir" ]] && is_flatpak_game "$game_dir"; then
-    return
-  fi
+  # Developer/testing override.
+  [[ "${DTAGNAN_TEST_MISSING:-}" == "vulkan32" ]] && return 1
 
   candidates=(
-    "${VULKAN_LIBRARY:-}" \
-    /lib/libvulkan.so.1 \
-    /lib32/libvulkan.so.1 \
-    /usr/lib/libvulkan.so.1 \
-    /usr/lib32/libvulkan.so.1 \
+    "${VULKAN_LIBRARY:-}"
+    /lib/libvulkan.so.1
+    /lib32/libvulkan.so.1
+    /usr/lib/libvulkan.so.1
+    /usr/lib32/libvulkan.so.1
     /usr/lib/i386-linux-gnu/libvulkan.so.1
   )
 
   if command -v ldconfig >/dev/null 2>&1; then
-    while IFS= read -r candidate; do
-      candidates+=("$candidate")
-    done < <(ldconfig -p 2>/dev/null | awk '/libvulkan\.so\.1/ { print $NF }')
+    while IFS= read -r c; do
+      candidates+=("$c")
+    done < <(
+      ldconfig -p 2>/dev/null |
+        awk '/libvulkan\.so\.1/ { print $NF }'
+    )
   fi
 
-  while IFS= read -r candidate; do
-    candidates+=("$candidate")
-  done < <(find /usr/lib /usr/lib32 /lib /lib32 \
-    -maxdepth 4 \( -type f -o -type l \) -name 'libvulkan.so*' 2>/dev/null || true)
+  for c in "${candidates[@]}"; do
+    [[ -n "$c" && -f "$c" ]] || continue
 
-  for candidate in "${candidates[@]}"; do
-    [[ -n "$candidate" && -f "$candidate" ]] || continue
-    if file -L "$candidate" | grep -qiE '32-bit|Intel 80386'; then
-      loader="$candidate"
-      break
+    if file -L "$c" | grep -qiE '32-bit|Intel 80386'; then
+      printf '%s\n' "$c"
+      return 0
     fi
   done
 
-  [[ -n "$loader" ]] || die "The 32-bit Vulkan loader was not found. Install your distribution's i686/i386 Vulkan loader and GPU driver."
+  return 1
+}
+
+check_vkbasalt() {
+  local game_dir="${1:-}" lib="" candidate
+  local -a candidates=()
+
+  # Flatpak Steam has its own runtime and therefore needs a Flatpak
+  # vkBasalt extension rather than a host-system 32-bit library.
+  if [[ -n "$game_dir" ]] && [[ "$(steam_backend_for_game "$game_dir")" == "flatpak" ]]; then
+    command -v flatpak >/dev/null 2>&1 || \
+      die "Flatpak Steam was detected, but the flatpak command is unavailable."
+
+    if flatpak list --runtime --columns=application,arch 2>/dev/null | \
+         grep -i 'vkBasalt' | grep -qi 'i386'; then
+      success "Flatpak 32-bit vkBasalt runtime detected."
+      return
+    fi
+
+    warning "Flatpak Steam is missing its 32-bit vkBasalt runtime."
+
+    if install_flatpak_vkbasalt_dependency; then
+      if flatpak list --runtime --columns=application,arch 2>/dev/null | \
+           grep -i 'vkBasalt' | grep -qi 'i386'; then
+        success "Flatpak 32-bit vkBasalt runtime installed."
+        return
+      fi
+    fi
+
+    die "Flatpak Steam still does not have a usable 32-bit vkBasalt runtime."
+  fi
+
+
+  if [[ "${DTAGNAN_TEST_MISSING:-}" == "vkbasalt32" ]]; then
+    lib=""
+  else
+    lib="$(find_vkbasalt32 || true)"
+  fi
+
+  if [[ -n "$lib" ]]; then
+    success "32-bit vkBasalt detected: $lib"
+    return
+  fi
+
+  warning "32-bit vkBasalt was not found."
+
+  set +e
+  offer_dependency_install \
+    vkbasalt32 \
+    "the 32-bit vkBasalt Vulkan layer"
+  dep_rc=$?
+  set -e
+
+  if (( dep_rc == 2 )); then
+    success "vkBasalt dependency test completed. No system changes were made."
+    return 0
+  elif (( dep_rc == 0 )); then
+
+    lib="$(find_vkbasalt32 || true)"
+
+    if [[ -n "$lib" ]]; then
+      success "32-bit vkBasalt installed: $lib"
+      return
+    fi
+
+    warning "Package installation completed, but no usable 32-bit vkBasalt library was detected."
+  fi
+
+  die "32-bit vkBasalt is required. Install the appropriate 32-bit vkBasalt package for your distribution, then run the installer again."
+}
+
+check_vulkan_loader() {
+  local game_dir="${1:-}" loader="" candidate
+
+  # Flatpak Steam supplies its own Vulkan loader.
+  if [[ -n "$game_dir" ]] && [[ "$(steam_backend_for_game "$game_dir")" == "flatpak" ]]; then
+    success "Flatpak Steam supplies the Vulkan loader."
+    return
+  fi
+
+
+  if [[ "${DTAGNAN_TEST_MISSING:-}" == "vulkan32" ]]; then
+    loader=""
+  else
+    loader="$(find_vulkan32 || true)"
+  fi
+
+  if [[ -n "$loader" ]]; then
+    success "32-bit Vulkan loader detected: $loader"
+    return
+  fi
+
+  warning "32-bit Vulkan loader was not found."
+
+  set +e
+  offer_dependency_install \
+    vulkan32 \
+    "the 32-bit Vulkan loader"
+  dep_rc=$?
+  set -e
+
+  if (( dep_rc == 2 )); then
+    success "Vulkan dependency test completed. No system changes were made."
+    return 0
+  elif (( dep_rc == 0 )); then
+
+    loader="$(find_vulkan32 || true)"
+
+    if [[ -n "$loader" ]]; then
+      success "32-bit Vulkan loader installed: $loader"
+      return
+    fi
+
+    warning "Package installation completed, but no usable 32-bit Vulkan loader was detected."
+  fi
+
+  die "A 32-bit Vulkan loader is required. Install your distribution's 32-bit Vulkan loader and GPU driver, then run the installer again."
 }
 
 detect_gpu_vendor() {
@@ -713,6 +1237,245 @@ already-installed vkBasalt layer when No More Heroes starts.
 EOF
 }
 
+
+
+
+
+test_dependencies() {
+  local dependency="${DTAGNAN_TEST_MISSING:-}"
+
+  print_rule
+  printf '  %sDTAGNAN MODS — DEPENDENCY TEST%s\n\n' "$BOLD" "$RESET"
+
+  case "$dependency" in
+    vkbasalt32)
+      note "Simulating missing 32-bit vkBasalt."
+      ;;
+    vulkan32)
+      note "Simulating missing 32-bit Vulkan loader."
+      ;;
+    "")
+      die "Choose a dependency with DTAGNAN_TEST_MISSING=vkbasalt32 or vulkan32."
+      ;;
+    *)
+      die "Unknown dependency simulation: $dependency"
+      ;;
+  esac
+
+  export DTAGNAN_DEPENDENCY_DRY_RUN=1
+
+  printf '  Package manager: %s\n\n' "$(detect_package_manager)"
+
+  case "$dependency" in
+    vkbasalt32)
+      if confirm_dependency_install "the 32-bit vkBasalt Vulkan layer"; then
+        local rc=0
+
+        set +e
+        install_native_dependency vkbasalt32
+        rc=$?
+        set -e
+
+        if (( rc == 2 )); then
+          success "vkBasalt automatic-install path works. No system changes were made."
+          return 0
+        fi
+
+        if (( rc == 1 )) && [[ "$(detect_package_manager)" == "steamos" ]]; then
+          success "SteamOS safety guard works. No system changes were made."
+          return 0
+        fi
+
+        die "Unexpected result from vkBasalt dependency test."
+      else
+        warning "Dependency installation declined. No changes were made."
+      fi
+      ;;
+
+    vulkan32)
+      if confirm_dependency_install "the 32-bit Vulkan loader"; then
+        local rc=0
+
+        set +e
+        install_native_dependency vulkan32
+        rc=$?
+        set -e
+
+        if (( rc == 2 )); then
+          success "Vulkan automatic-install path works. No system changes were made."
+          return 0
+        fi
+
+        if (( rc == 1 )) && [[ "$(detect_package_manager)" == "steamos" ]]; then
+          success "SteamOS safety guard works. No system changes were made."
+          return 0
+        fi
+
+        die "Unexpected result from Vulkan dependency test."
+      else
+        warning "Dependency installation declined. No changes were made."
+      fi
+      ;;
+  esac
+}
+
+doctor() {
+  local game_dir=""
+  local pm gpu steam_type platform_name
+  local vulkan32="" vkbasalt32=""
+  local payload_status="OK"
+  local game_status="NOT FOUND"
+  local writable_status="N/A"
+  local vulkan_status="MISSING"
+  local vkbasalt_status="MISSING"
+  local overall_ready=1
+
+  print_rule
+  printf '  %sDTAGNAN MODS — SYSTEM DOCTOR%s\n\n' "$BOLD" "$RESET"
+
+  detect_platform
+  platform_name="${PLATFORM_NAME:-Linux}"
+  pm="$(detect_package_manager)"
+  gpu="$(detect_gpu_vendor)"
+
+  # Locate the game without terminating the doctor if it is absent.
+  game_dir="$(find_game_dir 2>/dev/null || true)"
+
+  if [[ -n "$game_dir" && -f "$game_dir/nmh.exe" ]]; then
+    game_status="FOUND"
+    if [[ -w "$game_dir" ]]; then
+      writable_status="OK"
+    else
+      writable_status="NO"
+      overall_ready=0
+    fi
+
+    case "$(steam_backend_for_game "$game_dir")" in
+      flatpak)
+        steam_type="Flatpak"
+
+        # Flatpak supplies the Vulkan loader.
+        vulkan_status="OK (Flatpak runtime)"
+
+        if command -v flatpak >/dev/null 2>&1 &&
+           flatpak list --runtime --columns=application,arch 2>/dev/null |
+             grep -i 'vkBasalt' |
+             grep -qi 'i386'; then
+          vkbasalt_status="OK"
+        else
+          vkbasalt_status="MISSING"
+          overall_ready=0
+        fi
+        ;;
+
+      native)
+        steam_type="Native"
+
+        vulkan32="$(find_vulkan32 || true)"
+        vkbasalt32="$(find_vkbasalt32 || true)"
+
+        if [[ -n "$vulkan32" ]]; then
+          vulkan_status="OK"
+        else
+          overall_ready=0
+        fi
+
+        if [[ -n "$vkbasalt32" ]]; then
+          vkbasalt_status="OK"
+        else
+          overall_ready=0
+        fi
+        ;;
+
+      snap)
+        steam_type="Snap"
+
+        # Snap dependency handling is not finalized yet.
+        # Diagnose the host without claiming Snap runtime support.
+        vulkan32="$(find_vulkan32 || true)"
+        vkbasalt32="$(find_vkbasalt32 || true)"
+
+        [[ -n "$vulkan32" ]] && vulkan_status="OK"
+        [[ -n "$vkbasalt32" ]] && vkbasalt_status="OK"
+
+        overall_ready=0
+        ;;
+
+      *)
+        steam_type="Unknown"
+
+        vulkan32="$(find_vulkan32 || true)"
+        vkbasalt32="$(find_vkbasalt32 || true)"
+
+        [[ -n "$vulkan32" ]] && vulkan_status="OK"
+        [[ -n "$vkbasalt32" ]] && vkbasalt_status="OK"
+
+        overall_ready=0
+        ;;
+    esac
+  else
+    steam_type="Unknown"
+    overall_ready=0
+
+    # We can still diagnose host dependencies even without the game.
+    vulkan32="$(find_vulkan32 || true)"
+    vkbasalt32="$(find_vkbasalt32 || true)"
+
+    [[ -n "$vulkan32" ]] && vulkan_status="OK"
+    [[ -n "$vkbasalt32" ]] && vkbasalt_status="OK"
+  fi
+
+  # Validate packaged mod files without calling die().
+  local required
+  for required in \
+    "$ROOT/DXVK/d3d11.dll" \
+    "$ROOT/DXVK/dxgi.dll" \
+    "$ROOT/vkBasalt/Shaders/ReShade.fxh" \
+    "$ROOT/vkBasalt/Shaders/NMH_Bloom.fx" \
+    "$ROOT/vkBasalt/Shaders/NMH_Vignette.fx" \
+    "$ROOT/vkBasalt/Shaders/NMH_Dither.fx" \
+    "$ROOT/vkBasalt/LUTs/nmh-color.cube"
+  do
+    if [[ ! -f "$required" ]]; then
+      payload_status="INCOMPLETE"
+      overall_ready=0
+      break
+    fi
+  done
+
+  printf '  %-18s %s\n' "Platform"        "$platform_name"
+  printf '  %-18s %s\n' "Package manager" "$pm"
+  printf '  %-18s %s\n' "Steam"           "$steam_type"
+  printf '  %-18s %s\n' "Game"            "$game_status"
+  printf '  %-18s %s\n' "AppID"           "$APP_ID"
+  printf '  %-18s %s\n' "GPU"             "$gpu"
+  printf '  %-18s %s\n' "Vulkan 32-bit"   "$vulkan_status"
+  printf '  %-18s %s\n' "vkBasalt 32-bit" "$vkbasalt_status"
+  printf '  %-18s %s\n' "Game writable"   "$writable_status"
+  printf '  %-18s %s\n' "Payload"         "$payload_status"
+
+  if [[ -n "$game_dir" ]]; then
+    printf '\n  %-18s %s\n' "Game directory" "$game_dir"
+  fi
+
+  [[ -n "$vulkan32" ]] &&
+    printf '  %-18s %s\n' "Vulkan library" "$vulkan32"
+
+  [[ -n "$vkbasalt32" ]] &&
+    printf '  %-18s %s\n' "vkBasalt library" "$vkbasalt32"
+
+  printf '\n'
+  print_rule
+
+  if (( overall_ready )); then
+    success "System ready for Dtagnan Mods."
+    return 0
+  fi
+
+  warning "System is not fully ready. See the missing requirements above."
+  return 0
+}
+
 pause_menu() {
   printf '\n  %sPress Enter to return to the main menu...%s' "$DIM" "$RESET"
   read -r _
@@ -729,35 +1492,157 @@ confirm_restore() {
   esac
 }
 
+menu_system_check() {
+  local game_dir="" steam_backend="unknown" gpu="unknown"
+  local os_display="Linux"
+  local steam_display="Not found"
+  local game_display="Not found"
+  local gpu_display="Unknown"
+  local vulkan_display="Missing"
+  local vkbasalt_display="Missing"
+  local os_mark="✅" steam_mark="❌" game_mark="❌"
+  local gpu_mark="⚠️" vulkan_mark="❌" vkbasalt_mark="❌"
+
+  if [[ -r /etc/os-release ]]; then
+    os_display="$(
+      . /etc/os-release
+      printf '%s %s' "${NAME:-Linux}" "${VERSION_ID:-}"
+    )"
+  fi
+
+  game_dir="$(
+    DTAGNAN_GAME_DETECTION_INTERACTIVE=0 find_game_dir 2>/dev/null || true
+  )"
+
+  if [[ -n "$game_dir" && -f "$game_dir/nmh.exe" ]]; then
+    game_display="No More Heroes"
+    game_mark="✅"
+    steam_backend="$(steam_backend_for_game "$game_dir" 2>/dev/null || true)"
+  fi
+
+  case "$steam_backend" in
+    native)
+      steam_display="Native"
+      steam_mark="✅"
+      ;;
+    flatpak)
+      steam_display="Flatpak"
+      steam_mark="✅"
+      ;;
+    snap)
+      steam_display="Snap"
+      steam_mark="✅"
+      ;;
+    *)
+      if command -v steam >/dev/null 2>&1; then
+        steam_display="Installed"
+        steam_mark="✅"
+      elif command -v flatpak >/dev/null 2>&1 &&
+           flatpak info com.valvesoftware.Steam >/dev/null 2>&1; then
+        steam_display="Flatpak"
+        steam_mark="✅"
+      fi
+      ;;
+  esac
+
+  gpu="$(detect_gpu_vendor 2>/dev/null || true)"
+  case "${gpu,,}" in
+    *nvidia*)
+      gpu_display="NVIDIA"
+      gpu_mark="✅"
+      ;;
+    *amd*|*radeon*)
+      gpu_display="AMD"
+      gpu_mark="✅"
+      ;;
+    *intel*)
+      gpu_display="Intel"
+      gpu_mark="✅"
+      ;;
+  esac
+
+  if find_vulkan32 >/dev/null 2>&1; then
+    vulkan_display="Ready"
+    vulkan_mark="✅"
+  fi
+
+  if find_vkbasalt32 >/dev/null 2>&1; then
+    vkbasalt_display="Ready"
+    vkbasalt_mark="✅"
+  fi
+
+  printf '     🐧 OS\033[42G[ %-15s %s ]\n' "$os_display" "$os_mark"
+  printf '     ♨  Steam\033[42G[ %-15s %s ]\n' "$steam_display" "$steam_mark"
+  printf '     👾 Game\033[42G[ %-15s %s ]\n' "$game_display" "$game_mark"
+  printf '     🖥  GPU\033[42G[ %-15s %s ]\n' "$gpu_display" "$gpu_mark"
+  printf '     📦 Vulkan 32-bit\033[42G[ %-15s %s ]\n' "$vulkan_display" "$vulkan_mark"
+  printf '     📦 vkBasalt 32-bit\033[42G[ %-15s %s ]\n' "$vkbasalt_display" "$vkbasalt_mark"
+
+  if [[ "$steam_mark$game_mark$gpu_mark$vulkan_mark$vkbasalt_mark" == \
+        "✅✅✅✅✅" ]]; then
+    printf '\n'
+    printf '     🎯 Ready to be installed!\n'
+  else
+    printf '     ⚠ Some requirements are missing.\n'
+    printf '     🔧 Run the system doctor for details.\n'
+  fi
+}
+
 main_menu() {
   local choice
 
   while true; do
     clear 2>/dev/null || true
-    print_header
-    print_rule
+
     printf '\n'
-    printf '    %s%s1%s  Install or update the mod\n' "$BOLD" "$CYAN" "$RESET"
-    printf '    %s%s2%s  Verify the current installation\n' "$BOLD" "$CYAN" "$RESET"
-    printf '    %s%s3%s  Restore the original game DLLs\n' "$BOLD" "$CYAN" "$RESET"
-    printf '    %s%s4%s  Show Steam launch options\n' "$BOLD" "$CYAN" "$RESET"
-    printf '    %s%s5%s  About this mod\n' "$BOLD" "$CYAN" "$RESET"
-    printf '    %s%s6%s  Show before / after comparison\n' "$BOLD" "$CYAN" "$RESET"
-    printf '    %s%s7%s  Exit\n\n' "$BOLD" "$CYAN" "$RESET"
-    print_rule
-    printf '\n  %sChoose an option%s %s[1-7]%s: ' \
+    printf '╭──────────────────────────────────────────────────────────╮\n'
+    printf '│                                                          │\n'
+    printf '│                 ✦  DTAGNAN MODS  ✦                       │\n'
+    printf '│                   No More Heroes                         │\n'
+    printf '│                                                          │\n'
+    printf '│     Created by Suda51 at Grasshopper Manufacture 🇯🇵      │\n'
+    printf '│                                                          │\n'
+    printf '│              Linux Installation Wizard                   │\n'
+    printf '│                Made with ❤ for you.                      │\n'
+    printf '│                                                          │\n'
+    printf '╰──────────────────────────────────────────────────────────╯\n'
+    printf '\n'
+
+    printf '  ❤ Checking your system...\n'
+    printf '\n'
+
+    menu_system_check
+    printf '  ──────────────────────────────────────────────────────────\n'
+    printf '\n'
+
+    printf '  ✨ Dtagnan Mods — No More Heroes\n'
+    printf '\n'
+    printf '       %s[1]%s ❤ Install / Update\n' "$CYAN" "$RESET"
+    printf '       %s[2]%s ✓ Verify installation\n' "$CYAN" "$RESET"
+    printf '       %s[3]%s 🎮 Show Steam launch options\n' "$CYAN" "$RESET"
+    printf '       %s[4]%s 🗑️ Uninstall the mod\n' "$CYAN" "$RESET"
+    printf '       %s[5]%s ✦ About this mod\n' "$CYAN" "$RESET"
+    printf '       %s[6]%s 🚪 Exit\n' "$CYAN" "$RESET"
+    printf '\n'
+    printf '  %sChoose an option%s %s[1-6]%s: ' \
       "$BOLD" "$RESET" "$DIM" "$RESET"
+
     read -r choice
 
     case "$choice" in
       1) install_mod; pause_menu ;;
       2) verify_mod; pause_menu ;;
-      3) confirm_restore; pause_menu ;;
-      4) show_launch_options; pause_menu ;;
+      3) show_launch_options; pause_menu ;;
+      4) confirm_restore; pause_menu ;;
       5) show_about; pause_menu ;;
-      6) show_comparison; pause_menu ;;
-      7) printf '\n  %sGoodbye.%s\n' "$GREEN" "$RESET"; return ;;
-      *) warning "Invalid option. Choose a number from 1 to 7."; sleep 1 ;;
+      6)
+        printf '\n  ❤ %sSee you next time.%s\n' "$GREEN" "$RESET"
+        return
+        ;;
+      *)
+        warning "Invalid option. Choose a number from 1 to 6."
+        sleep 1
+        ;;
     esac
   done
 }
@@ -772,6 +1657,8 @@ Usage:
   ./install.sh options                     Show Steam launch options
   ./install.sh about                       Explain what the mod installs
   ./install.sh compare                     Show the before / after comparison
+  ./install.sh doctor                      Run a read-only system diagnostic
+  ./install.sh test-deps                   Test dependency installation safely
 EOF
 }
 
@@ -785,6 +1672,8 @@ case "$ACTION" in
   options) show_launch_options ;;
   about)   show_about ;;
   compare) show_comparison ;;
+  doctor)  doctor ;;
+  test-deps) test_dependencies ;;
   -h|--help|help) usage ;;
   *) usage; die "Unknown action: $ACTION" ;;
 esac
