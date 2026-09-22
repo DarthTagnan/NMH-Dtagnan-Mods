@@ -9,7 +9,7 @@
 
 **Custom DXVK build · SMAA · Color LUT · Bloom · Vignette · CAS · Dithering**
 
-**Installer version 1.0**
+**Version 1.1**
 
 </div>
 
@@ -78,12 +78,18 @@ The installer supports:
 
 - native Steam for Linux;
 - the standard Steam Flatpak installation;
+- Steam Deck and SteamOS without disabling the read-only system image;
 - Steam's primary library;
-- additional libraries declared in `libraryfolders.vdf`;
+- additional libraries and Steam Deck microSD cards declared in
+  `libraryfolders.vdf`, including current and legacy formats;
 - NVIDIA hybrid graphics, NVIDIA-only, AMD and Intel systems;
 - custom XDG data and configuration directories;
 - installation paths containing spaces;
+- installation paths containing Unicode characters and symbolic links;
 - an explicitly supplied game directory.
+
+Snap Steam is detected but intentionally refused because its confined
+filesystem cannot currently be supported safely.
 
 NVIDIA PRIME variables are added only when a hybrid NVIDIA system is detected.
 AMD, Intel and NVIDIA-only systems receive vendor-appropriate launch options
@@ -108,7 +114,7 @@ Vulkan loader and vkBasalt layer before modifying the game.
 ### Fedora
 
 ```bash
-sudo dnf install vkBasalt
+sudo dnf install vkBasalt.i686 vulkan-loader.i686
 
 # AMD or Intel with Mesa
 sudo dnf install mesa-vulkan-drivers.x86_64 mesa-vulkan-drivers.i686
@@ -122,9 +128,15 @@ sudo dnf install chafa
 
 ### Arch Linux
 
-Install the Vulkan loader, its `lib32-` counterpart, vkBasalt and a compatible
-32-bit vkBasalt build. Install the correct Vulkan driver and matching `lib32-`
-driver for the GPU.
+Enable the official `[multilib]` repository, then install the 32-bit Vulkan
+loader and the matching 32-bit Vulkan driver for the GPU:
+
+```bash
+sudo pacman -S --needed lib32-vulkan-icd-loader
+```
+
+A compatible 32-bit vkBasalt build is also required. It is not provided by the
+standard Arch repositories used by the automated container test.
 
 ### Debian and Ubuntu derivatives
 
@@ -139,6 +151,38 @@ sudo apt update
 Package names and vkBasalt availability vary between releases. Confirm that a
 32-bit `libvulkan.so.1`, 32-bit `libvkbasalt.so`, and the matching 32-bit GPU
 driver are available.
+
+The installer can configure `i386` and install `libvulkan1:i386`
+automatically. A compatible 32-bit vkBasalt build may still require a manual
+installation.
+
+### openSUSE
+
+The installer can install the 32-bit Vulkan loader automatically:
+
+```bash
+sudo zypper install libvulkan1-32bit
+```
+
+A compatible 32-bit vkBasalt build is also required. `vkBasalt-32bit` was not
+available from the standard Tumbleweed repositories used by the automated
+container test.
+
+### Steam Deck and SteamOS
+
+Steam Deck native Steam, internal storage and registered microSD libraries are
+supported. The installer never disables SteamOS read-only mode and never
+modifies the immutable system image.
+
+If the required 32-bit Vulkan loader or vkBasalt layer is missing, installation
+stops before changing the game. A user-local 32-bit vkBasalt installation is
+detected in locations such as:
+
+```text
+~/.local/lib32/libvkbasalt.so
+~/.local/lib/vkbasalt/libvkbasalt.so
+~/.local/lib/libvkbasalt.so
+```
 
 ### Steam Flatpak
 
@@ -199,6 +243,8 @@ to prevent files from being installed in root's home directory.
 ./install.sh options
 ./install.sh about
 ./install.sh compare
+./install.sh doctor
+./install.sh test-deps
 ```
 
 For an unusual Steam layout, provide the game directory explicitly:
@@ -246,11 +292,41 @@ prevents a failed copy from truncating a working file.
 Additional safeguards include:
 
 - restoration metadata is committed before the game DLLs are changed;
-- `SIGINT`, `SIGHUP` and `SIGTERM` trigger temporary-file cleanup;
+- `SIGINT`, `SIGHUP` and `SIGTERM` trigger rollback and temporary-file cleanup;
 - an interrupted second DLL installation remains fully restorable;
 - an interrupted configuration update preserves the previous configuration;
 - the next installation removes stale transaction files left by an
   untrappable interruption such as power loss or `SIGKILL`.
+- a failed installation restores the original DLLs and configuration
+  automatically before exiting.
+
+## Automated tests
+
+The release includes two test programs:
+
+```bash
+./audit_crash_test.sh
+./podman-platform-tests.sh --full-packages
+```
+
+The crash suite covers 107 scenarios, including installation, verification,
+uninstallation, interrupted writes, rollback, repeated updates, corrupt
+metadata, Steam libraries, Flatpak, Steam Deck microSD paths, Unicode paths,
+custom XDG directories and GPU launch options.
+
+The full Podman matrix passed on all four tested distribution families:
+
+| Container | Package manager | Result |
+|---|---:|---:|
+| Fedora | `dnf` | Passed |
+| Ubuntu | `apt` | Passed |
+| Arch Linux | `pacman` | Passed |
+| openSUSE Tumbleweed | `zypper` | Passed |
+
+These containers validate distribution packaging and installer behavior. A
+final test on physical Steam Deck hardware is still recommended because a
+container cannot reproduce the Deck's GPU, Steam client or immutable operating
+system exactly.
 
 ## Updating
 
@@ -362,4 +438,5 @@ configuration and installer are part of this Dtagnan Mods release.
 This is an unofficial community project and is not affiliated with Grasshopper
 Manufacture, Marvelous, XSEED Games, Valve, DXVK, vkBasalt or ReShade. Refer to
 the licenses of the bundled open-source components and source patch before
-redistribution.
+redistribution. The exact DXVK source modification, upstream revision and
+reproduction instructions are included in `Source-patch/`.

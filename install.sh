@@ -6,7 +6,7 @@ GAME_NAME="No More Heroes"
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 ACTION="${1:-menu}"
 EXPLICIT_GAME_DIR="${2:-}"
-MOD_VERSION="1.1.3"
+MOD_VERSION="1.1"
 D3D11_SHA256="4edc6a6abb56a056b37799edb510e9b52209fe3f47e25722c676346cddc16428"
 DXGI_SHA256="bc82659d936412f8c1d911adbba859b09733ad0174190c683665058e4990106e"
 BEFORE_SHA256="25d1306a9a599bc70667654ac0f9d0230cd4f733415728ab3ed6ffffe7f1fbcc"
@@ -29,6 +29,8 @@ COMPARISON_DIR="$ROOT/Comparison"
 BEFORE_IMAGE="$COMPARISON_DIR/Before.png"
 AFTER_IMAGE="$COMPARISON_DIR/After.png"
 TEMP_FILES=()
+INSTALL_TRANSACTION_ACTIVE=0
+INSTALL_TRANSACTION_GAME=""
 
 cleanup_temp_files() {
   local temporary
@@ -37,7 +39,56 @@ cleanup_temp_files() {
   done
 }
 
-trap cleanup_temp_files EXIT
+rollback_failed_install() {
+  local current installed packaged
+  [[ "$INSTALL_TRANSACTION_ACTIVE" == "1" ]] || return 0
+  [[ -n "$INSTALL_TRANSACTION_GAME" ]] || return 0
+
+  set +e
+  for current in d3d11.dll dxgi.dll; do
+    if state_has "$current=present" && [[ -s "$BACKUP_DIR/$current" ]]; then
+      install -m 0644 -- "$BACKUP_DIR/$current" \
+        "$INSTALL_TRANSACTION_GAME/$current"
+    elif state_has "$current=absent"; then
+      if [[ ! -e "$INSTALL_TRANSACTION_GAME/$current" ]] ||
+         cmp -s -- "$INSTALL_TRANSACTION_GAME/$current" "$ROOT/DXVK/$current"; then
+        rm -f -- "$INSTALL_TRANSACTION_GAME/$current"
+      fi
+    fi
+  done
+
+  if state_has 'config=present' && [[ -s "$CONFIG_BACKUP" ]]; then
+    cp -a -- "$CONFIG_BACKUP" "$CONFIG_FILE"
+  elif state_has 'config=absent' && [[ -f "$CONFIG_FILE" ]] &&
+       grep -q '^# No More Heroes - Dtagnan Mods' "$CONFIG_FILE"; then
+    rm -f -- "$CONFIG_FILE"
+  fi
+
+  while IFS='|' read -r installed packaged; do
+    [[ -f "$installed" ]] && cmp -s -- "$installed" "$packaged" &&
+      rm -f -- "$installed"
+  done <<EOF
+$SHADER_DIR/ReShade.fxh|$ROOT/vkBasalt/Shaders/ReShade.fxh
+$SHADER_DIR/NMH_Bloom.fx|$ROOT/vkBasalt/Shaders/NMH_Bloom.fx
+$SHADER_DIR/NMH_Vignette.fx|$ROOT/vkBasalt/Shaders/NMH_Vignette.fx
+$SHADER_DIR/NMH_Dither.fx|$ROOT/vkBasalt/Shaders/NMH_Dither.fx
+$LUT_DIR/nmh-color.cube|$ROOT/vkBasalt/LUTs/nmh-color.cube
+EOF
+  set -e
+  printf '\n  %s%s[ROLLBACK]%s Installation failed; original game files were restored.\n' \
+    "${BOLD:-}" "${YELLOW:-}" "${RESET:-}" >&2
+}
+
+cleanup_on_exit() {
+  local rc=$?
+  if (( rc != 0 )); then
+    rollback_failed_install
+  fi
+  cleanup_temp_files
+  return "$rc"
+}
+
+trap cleanup_on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' HUP TERM
 
@@ -102,6 +153,23 @@ detect_platform() {
   OS_NAME=""
   OS_VARIANT_ID=""
 
+  # Development/testing override. Never used unless explicitly requested.
+  if [[ -n "${DTAGNAN_TEST_PLATFORM:-}" ]]; then
+    case "$DTAGNAN_TEST_PLATFORM" in
+      linux)
+        return 0
+        ;;
+      steamdeck)
+        PLATFORM="steamdeck"
+        PLATFORM_NAME="Steam Deck / SteamOS"
+        return 0
+        ;;
+      *)
+        die "Unknown platform simulation: $DTAGNAN_TEST_PLATFORM"
+        ;;
+    esac
+  fi
+
   if [[ -r /etc/os-release ]]; then
     OS_ID="$(sed -n 's/^ID=//p' /etc/os-release | head -n1 | tr -d '"')"
     OS_ID_LIKE="$(sed -n 's/^ID_LIKE=//p' /etc/os-release | head -n1 | tr -d '"')"
@@ -141,7 +209,7 @@ preflight() {
   fi
 
   local command
-  for command in realpath install cmp sed grep awk sha256sum file head cp mv rm mkdir chmod uname; do
+  for command in realpath install cmp sed grep awk sha256sum file head cp mv rm rmdir mkdir chmod uname; do
     require_command "$command"
   done
 }
@@ -186,6 +254,18 @@ cleanup_stale_install_files() {
       rm -f -- "$stale"
     done
   done
+}
+
+steam_library_paths() {
+  local library_file="$1"
+  [[ -f "$library_file" ]] || return 0
+
+  # Current Steam format: "path" "/library".
+  # Legacy Steam format:  "1"    "/library".
+  sed -n \
+    -e 's/^[[:space:]]*"path"[[:space:]]*"\([^"]*\)".*/\1/p' \
+    -e 's/^[[:space:]]*"[0-9][0-9]*"[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$library_file"
 }
 
 steam_backend_for_game() {
@@ -244,10 +324,7 @@ steam_backend_for_game() {
         printf '%s\n' "$backend"
         return
       fi
-    done < <(
-      sed -n 's/^[[:space:]]*"path"[[:space:]]*"\([^"]*\)".*/\1/p' \
-        "$library_file"
-    )
+    done < <(steam_library_paths "$library_file")
   done
 
   printf 'unknown\n'
@@ -327,10 +404,7 @@ find_game_dir() {
       path="${path//\\\\/\\}"
       [[ -n "$path" ]] || continue
       add_steamapps_dir "$path/steamapps"
-    done < <(
-      sed -n 's/^[[:space:]]*"path"[[:space:]]*"\([^"]*\)".*/\1/p' \
-        "$library"
-    )
+    done < <(steam_library_paths "$library")
   }
 
   # Check the standard Steam locations first. realpath normalization
@@ -437,19 +511,25 @@ configure_install_scope() {
   CONFIG_FILE="$CONFIG_DIR/nmh.conf"
   CONFIG_BACKUP="$CONFIG_DIR/nmh.conf.pre-dtagnan-mods"
 
-  if [[ "$steam_backend" == "flatpak" ]]; then
-    DATA_HOME="$HOME/.var/app/com.valvesoftware.Steam/data"
-    CONFIG_HOME="$HOME/.var/app/com.valvesoftware.Steam/config"
-    RUNTIME_DIR="$DATA_HOME/Dtagnan-Mods/No-More-Heroes"
-    CONFIG_DIR="$CONFIG_HOME/vkBasalt"
-    CONFIG_FILE="$CONFIG_DIR/nmh.conf"
-    CONFIG_BACKUP="$CONFIG_DIR/nmh.conf.pre-dtagnan-mods"
-    VISIBLE_RUNTIME_DIR="$HOME/.local/share/Dtagnan-Mods/No-More-Heroes"
-    VISIBLE_CONFIG_FILE="$HOME/.config/vkBasalt/nmh.conf"
-  else
-    VISIBLE_RUNTIME_DIR="$RUNTIME_DIR"
-    VISIBLE_CONFIG_FILE="$CONFIG_FILE"
-  fi
+  case "$steam_backend" in
+    flatpak)
+      DATA_HOME="$HOME/.var/app/com.valvesoftware.Steam/data"
+      CONFIG_HOME="$HOME/.var/app/com.valvesoftware.Steam/config"
+      RUNTIME_DIR="$DATA_HOME/Dtagnan-Mods/No-More-Heroes"
+      CONFIG_DIR="$CONFIG_HOME/vkBasalt"
+      CONFIG_FILE="$CONFIG_DIR/nmh.conf"
+      CONFIG_BACKUP="$CONFIG_DIR/nmh.conf.pre-dtagnan-mods"
+      VISIBLE_RUNTIME_DIR="$RUNTIME_DIR"
+      VISIBLE_CONFIG_FILE="$CONFIG_FILE"
+      ;;
+    snap)
+      die "Snap Steam is detected, but its confined filesystem is not supported safely. Use native Steam or Flatpak Steam."
+      ;;
+    *)
+      VISIBLE_RUNTIME_DIR="$RUNTIME_DIR"
+      VISIBLE_CONFIG_FILE="$CONFIG_FILE"
+      ;;
+  esac
 
   SHADER_DIR="$RUNTIME_DIR/Shaders"
   TEXTURE_DIR="$RUNTIME_DIR/Textures"
@@ -659,7 +739,7 @@ install_flatpak_vkbasalt_dependency() {
   runtime="$(
     flatpak remote-ls --runtime --columns=ref 2>/dev/null |
       grep -Ei 'vkBasalt' |
-      grep -Ei 'i386|x86_64' |
+      grep -Ei 'i386' |
       head -n 1 || true
   )"
 
@@ -682,6 +762,9 @@ find_vkbasalt32() {
 
   candidates=(
     "${VKBASALT_LIBRARY:-}"
+    "$HOME/.local/lib32/libvkbasalt.so"
+    "$HOME/.local/lib/vkbasalt/libvkbasalt.so"
+    "$HOME/.local/lib/libvkbasalt.so"
     /usr/lib/vkbasalt/libvkbasalt.so
     /usr/lib32/libvkbasalt.so
     /usr/lib32/vkbasalt/libvkbasalt.so
@@ -961,9 +1044,54 @@ state_has() {
   [[ -f "$BACKUP_STATE" ]] && grep -Fqx -- "$1" "$BACKUP_STATE"
 }
 
+refresh_existing_backups() {
+  local game_dir="$1" current tmp_state config_state
+  tmp_state="$BACKUP_STATE.tmp.$$"
+  TEMP_FILES+=("$tmp_state")
+  : > "$tmp_state"
+
+  for current in d3d11.dll dxgi.dll; do
+    if [[ -f "$game_dir/$current" ]] &&
+       ! cmp -s -- "$game_dir/$current" "$ROOT/DXVK/$current"; then
+      # Steam (or another repair tool) replaced the mod DLL. Preserve this
+      # newest original instead of later restoring a stale game version.
+      install_atomic "$game_dir/$current" "$BACKUP_DIR/$current"
+      printf '%s=present\n' "$current" >> "$tmp_state"
+    elif state_has "$current=present"; then
+      [[ -s "$BACKUP_DIR/$current" ]] || \
+        die "The saved original $current is missing or empty. Verify the game files in Steam, then install again."
+      printf '%s=present\n' "$current" >> "$tmp_state"
+    elif state_has "$current=absent"; then
+      printf '%s=absent\n' "$current" >> "$tmp_state"
+    else
+      die "Invalid backup state for $current"
+    fi
+  done
+
+  if [[ -f "$CONFIG_FILE" ]] &&
+     ! grep -q '^# No More Heroes - Dtagnan Mods' "$CONFIG_FILE"; then
+    cp -a -- "$CONFIG_FILE" "$CONFIG_BACKUP"
+    config_state="present"
+  elif state_has 'config=present'; then
+    [[ -s "$CONFIG_BACKUP" ]] || \
+      die "The saved vkBasalt configuration is missing or empty."
+    config_state="present"
+  elif state_has 'config=absent'; then
+    config_state="absent"
+  else
+    die "Invalid backup state for the vkBasalt configuration"
+  fi
+  printf 'config=%s\n' "$config_state" >> "$tmp_state"
+
+  mv -f -- "$tmp_state" "$BACKUP_STATE"
+}
+
 prepare_backups() {
   local game_dir="$1" current tmp_state
-  [[ -f "$BACKUP_STATE" ]] && return
+  if [[ -f "$BACKUP_STATE" ]]; then
+    refresh_existing_backups "$game_dir"
+    return
+  fi
 
   mkdir -p -- "$BACKUP_DIR" "$CONFIG_DIR"
   tmp_state="$BACKUP_STATE.tmp.$$"
@@ -1012,6 +1140,8 @@ install_mod() {
   cleanup_stale_install_files "$game_dir"
   [[ -w "$game_dir" ]] || die "The game directory is not writable: $game_dir"
   prepare_backups "$game_dir"
+  INSTALL_TRANSACTION_GAME="$game_dir"
+  INSTALL_TRANSACTION_ACTIVE=1
 
   install_atomic "$ROOT/vkBasalt/Shaders/ReShade.fxh" "$SHADER_DIR/ReShade.fxh"
   install_atomic "$ROOT/vkBasalt/Shaders/NMH_Bloom.fx" "$SHADER_DIR/NMH_Bloom.fx"
@@ -1030,6 +1160,7 @@ install_mod() {
   show_launch_options "$game_dir"
 
   verify_mod "$game_dir"
+  INSTALL_TRANSACTION_ACTIVE=0
 }
 
 verify_mod() {
@@ -1076,7 +1207,7 @@ verify_mod() {
 }
 
 restore_vanilla() {
-  local game_dir current
+  local game_dir current installed packaged
   game_dir="$(find_game_dir)"
   configure_install_scope "$game_dir"
 
@@ -1111,7 +1242,32 @@ restore_vanilla() {
     die "Invalid backup state for the vkBasalt configuration"
   fi
 
+  # Remove only assets that still match this package. User-edited files are
+  # deliberately retained instead of being deleted during uninstall.
+  while IFS='|' read -r installed packaged; do
+    [[ -n "$installed" ]] || continue
+    if [[ -f "$installed" ]]; then
+      if cmp -s -- "$installed" "$packaged"; then
+        rm -f -- "$installed"
+      else
+        warning "Modified file was left untouched: $installed"
+      fi
+    fi
+  done <<EOF
+$SHADER_DIR/ReShade.fxh|$ROOT/vkBasalt/Shaders/ReShade.fxh
+$SHADER_DIR/NMH_Bloom.fx|$ROOT/vkBasalt/Shaders/NMH_Bloom.fx
+$SHADER_DIR/NMH_Vignette.fx|$ROOT/vkBasalt/Shaders/NMH_Vignette.fx
+$SHADER_DIR/NMH_Dither.fx|$ROOT/vkBasalt/Shaders/NMH_Dither.fx
+$LUT_DIR/nmh-color.cube|$ROOT/vkBasalt/LUTs/nmh-color.cube
+EOF
+
+  rm -f -- "$BACKUP_DIR/d3d11.dll" "$BACKUP_DIR/dxgi.dll" \
+    "$BACKUP_STATE" "$CONFIG_BACKUP"
+  rmdir -- "$SHADER_DIR" "$TEXTURE_DIR" "$LUT_DIR" "$BACKUP_DIR" \
+    "$RUNTIME_DIR" 2>/dev/null || true
+
   success "Original DLLs restored to: $game_dir"
+  success "Dtagnan Mods files removed."
   warning "Remember to remove the mod launch options from Steam."
 }
 
@@ -1281,9 +1437,17 @@ test_dependencies() {
           return 0
         fi
 
-        if (( rc == 1 )) && [[ "$(detect_package_manager)" == "steamos" ]]; then
-          success "SteamOS safety guard works. No system changes were made."
-          return 0
+        if (( rc == 1 )); then
+          case "$(detect_package_manager)" in
+            steamos)
+              success "SteamOS safety guard works. No system changes were made."
+              return 0
+              ;;
+            apt|pacman|zypper|unknown)
+              success "Unsupported-package fallback works. No system changes were made."
+              return 0
+              ;;
+          esac
         fi
 
         die "Unexpected result from vkBasalt dependency test."
@@ -1306,9 +1470,17 @@ test_dependencies() {
           return 0
         fi
 
-        if (( rc == 1 )) && [[ "$(detect_package_manager)" == "steamos" ]]; then
-          success "SteamOS safety guard works. No system changes were made."
-          return 0
+        if (( rc == 1 )); then
+          case "$(detect_package_manager)" in
+            steamos)
+              success "SteamOS safety guard works. No system changes were made."
+              return 0
+              ;;
+            unknown)
+              success "Unsupported-package fallback works. No system changes were made."
+              return 0
+              ;;
+          esac
         fi
 
         die "Unexpected result from Vulkan dependency test."
@@ -1339,7 +1511,7 @@ doctor() {
   gpu="$(detect_gpu_vendor)"
 
   # Locate the game without terminating the doctor if it is absent.
-  game_dir="$(find_game_dir 2>/dev/null || true)"
+  game_dir="$(find_game_dir 2>/dev/null)" || game_dir=""
 
   if [[ -n "$game_dir" && -f "$game_dir/nmh.exe" ]]; then
     game_status="FOUND"
@@ -1436,12 +1608,21 @@ doctor() {
     "$ROOT/vkBasalt/Shaders/NMH_Dither.fx" \
     "$ROOT/vkBasalt/LUTs/nmh-color.cube"
   do
-    if [[ ! -f "$required" ]]; then
+    if [[ ! -s "$required" ]]; then
       payload_status="INCOMPLETE"
       overall_ready=0
       break
     fi
   done
+
+  if [[ "$payload_status" == "OK" &&
+        "${DTAGNAN_SKIP_PAYLOAD_HASH_CHECK:-0}" != "1" ]]; then
+    if [[ "$(sha256sum "$ROOT/DXVK/d3d11.dll" | awk '{print $1}')" != "$D3D11_SHA256" ||
+          "$(sha256sum "$ROOT/DXVK/dxgi.dll" | awk '{print $1}')" != "$DXGI_SHA256" ]]; then
+      payload_status="CORRUPT"
+      overall_ready=0
+    fi
+  fi
 
   printf '  %-18s %s\n' "Platform"        "$platform_name"
   printf '  %-18s %s\n' "Package manager" "$pm"
@@ -1511,8 +1692,8 @@ menu_system_check() {
   fi
 
   game_dir="$(
-    DTAGNAN_GAME_DETECTION_INTERACTIVE=0 find_game_dir 2>/dev/null || true
-  )"
+    DTAGNAN_GAME_DETECTION_INTERACTIVE=0 find_game_dir 2>/dev/null
+  )" || game_dir=""
 
   if [[ -n "$game_dir" && -f "$game_dir/nmh.exe" ]]; then
     game_display="No More Heroes"
@@ -1531,7 +1712,7 @@ menu_system_check() {
       ;;
     snap)
       steam_display="Snap"
-      steam_mark="✅"
+      steam_mark="⚠️"
       ;;
     *)
       if command -v steam >/dev/null 2>&1; then
@@ -1561,22 +1742,35 @@ menu_system_check() {
       ;;
   esac
 
-  if find_vulkan32 >/dev/null 2>&1; then
+  if [[ "$steam_backend" == "flatpak" ]]; then
     vulkan_display="Ready"
     vulkan_mark="✅"
+
+    if command -v flatpak >/dev/null 2>&1 &&
+       flatpak list --runtime --columns=application,arch 2>/dev/null |
+         grep -i 'vkBasalt' |
+         grep -qi 'i386'; then
+      vkbasalt_display="Ready"
+      vkbasalt_mark="✅"
+    fi
+  else
+    if find_vulkan32 >/dev/null 2>&1; then
+      vulkan_display="Ready"
+      vulkan_mark="✅"
+    fi
+
+    if find_vkbasalt32 >/dev/null 2>&1; then
+      vkbasalt_display="Ready"
+      vkbasalt_mark="✅"
+    fi
   fi
 
-  if find_vkbasalt32 >/dev/null 2>&1; then
-    vkbasalt_display="Ready"
-    vkbasalt_mark="✅"
-  fi
-
-  printf '     🐧 OS\033[42G[ %-15s %s ]\n' "$os_display" "$os_mark"
-  printf '     ♨  Steam\033[42G[ %-15s %s ]\n' "$steam_display" "$steam_mark"
-  printf '     👾 Game\033[42G[ %-15s %s ]\n' "$game_display" "$game_mark"
-  printf '     🖥  GPU\033[42G[ %-15s %s ]\n' "$gpu_display" "$gpu_mark"
-  printf '     📦 Vulkan 32-bit\033[42G[ %-15s %s ]\n' "$vulkan_display" "$vulkan_mark"
-  printf '     📦 vkBasalt 32-bit\033[42G[ %-15s %s ]\n' "$vkbasalt_display" "$vkbasalt_mark"
+  printf '     🐧 OS\033[39G[ %-15.15s %s ]\n' "$os_display" "$os_mark"
+  printf '     ♨  Steam\033[39G[ %-15.15s %s ]\n' "$steam_display" "$steam_mark"
+  printf '     👾 Game\033[39G[ %-15.15s %s ]\n' "$game_display" "$game_mark"
+  printf '     🖥  GPU\033[39G[ %-15.15s %s ]\n' "$gpu_display" "$gpu_mark"
+  printf '     📦 Vulkan 32-bit\033[39G[ %-15.15s %s ]\n' "$vulkan_display" "$vulkan_mark"
+  printf '     📦 vkBasalt 32-bit\033[39G[ %-15.15s %s ]\n' "$vkbasalt_display" "$vkbasalt_mark"
 
   if [[ "$steam_mark$game_mark$gpu_mark$vulkan_mark$vkbasalt_mark" == \
         "✅✅✅✅✅" ]]; then
@@ -1597,13 +1791,12 @@ main_menu() {
     printf '\n'
     printf '╭──────────────────────────────────────────────────────────╮\n'
     printf '│                                                          │\n'
-    printf '│                 ✦  DTAGNAN MODS  ✦                       │\n'
-    printf '│                   No More Heroes                         │\n'
+    printf '│                    ✦  DTAGNAN MODS  ✦                    │\n'
+    printf '│                Linux Installation Wizard                 │\n'
+    printf '│                    For No More Heroes                    │\n'
     printf '│                                                          │\n'
     printf '│     Created by Suda51 at Grasshopper Manufacture 🇯🇵      │\n'
-    printf '│                                                          │\n'
-    printf '│              Linux Installation Wizard                   │\n'
-    printf '│                Made with ❤ for you.                      │\n'
+    printf '│                   Made with ❤ for you.                   │\n'
     printf '│                                                          │\n'
     printf '╰──────────────────────────────────────────────────────────╯\n'
     printf '\n'
@@ -1617,12 +1810,12 @@ main_menu() {
 
     printf '  ✨ Dtagnan Mods — No More Heroes\n'
     printf '\n'
-    printf '       %s[1]%s ❤ Install / Update\n' "$CYAN" "$RESET"
-    printf '       %s[2]%s ✓ Verify installation\n' "$CYAN" "$RESET"
-    printf '       %s[3]%s 🎮 Show Steam launch options\n' "$CYAN" "$RESET"
-    printf '       %s[4]%s 🗑️ Uninstall the mod\n' "$CYAN" "$RESET"
-    printf '       %s[5]%s ✦ About this mod\n' "$CYAN" "$RESET"
-    printf '       %s[6]%s 🚪 Exit\n' "$CYAN" "$RESET"
+    printf '     %s[1]%s ❤ Install / Update\n' "$CYAN" "$RESET"
+    printf '     %s[2]%s ✓ Verify installation\n' "$CYAN" "$RESET"
+    printf '     %s[3]%s 🎮 Show Steam launch options\n' "$CYAN" "$RESET"
+    printf '     %s[4]%s 🗑️ Uninstall the mod\n' "$CYAN" "$RESET"
+    printf '     %s[5]%s ✦ About this mod\n' "$CYAN" "$RESET"
+    printf '     %s[6]%s 🚪 Exit\n' "$CYAN" "$RESET"
     printf '\n'
     printf '  %sChoose an option%s %s[1-6]%s: ' \
       "$BOLD" "$RESET" "$DIM" "$RESET"
