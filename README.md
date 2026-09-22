@@ -29,19 +29,9 @@ Linux is required. This is not a Windows mod or Windows installer.
 
 ## Before and after
 
-<p align="center">
-  <strong>Original presentation</strong>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <strong>Dtagnan Mods post-processing</strong>
-</p>
-
-<p align="center">
-  <a href="./Comparison/Before.png">
-    <img src="./Comparison/Before.png" alt="Original presentation" width="49%">
-  </a>
-  <a href="./Comparison/After.png">
-    <img src="./Comparison/After.png" alt="Dtagnan Mods post-processing" width="49%">
-  </a>
-</p>
+| Original presentation | Dtagnan Mods post-processing |
+|:---:|:---:|
+| ![Original presentation](Comparison/Before.png) | ![Dtagnan Mods post-processing](Comparison/After.png) |
 
 
 ## What the mod installs
