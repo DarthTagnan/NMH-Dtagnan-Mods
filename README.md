@@ -30,12 +30,14 @@ Linux is required. This is not a Windows mod or Windows installer.
 ## Before and after
 
 
+
 | Original presentation | Dtagnan Mods post-processing |
 |:---:|:---:|
 | ![Original presentation](Comparison/Before.png) | ![Dtagnan Mods post-processing](Comparison/After.png) |
 
 The installer can also display these images from its interactive menu. With
 `chafa`, Kitty or WezTerm, they are rendered directly inside the terminal.
+
 
 
 ## What the mod installs
